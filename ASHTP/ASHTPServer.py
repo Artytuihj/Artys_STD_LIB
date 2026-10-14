@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import tempfile
 import time
 from pathlib import Path
 
-import fastapi
-import requests
-import asyncio
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -18,8 +17,8 @@ from fastapi import FastAPI, Request, Response
 import logging
 import IKeyAuthority
 from dataclasses import dataclass, field
-from cryptography.exceptions import InvalidTag
 import secrets
+from IKeyAuthority import IKeyAuthority as ika
 
 class HandshakeError(Exception):
     pass
@@ -27,17 +26,16 @@ class HandshakeError(Exception):
 class ParsingError(Exception):
     pass
 
+class ReplayError(Exception):
+    pass
+
+
 
 def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,bytes]:
     symKey = HKDF(algorithm=hashes.SHA256(), length=length, salt=None,
                   info=b"ashtp sym sesscion key" + transcrypt).derive(secret)
     return symKey[32:], symKey[:32]
 
-def _Expire(self, max_age: float = 10.0):
-    now = time.monotonic()
-    for sid, s in list(self.activeSessions.items()):
-        if not s.authenticated and now - s.created > max_age:
-            del self.activeSessions[sid]
 
 @dataclass
 class ActiveSession:
@@ -50,29 +48,29 @@ class Session():
         self.send = ChaCha20Poly1305(send_key)
         self.recv = ChaCha20Poly1305(recv_key)
         self.sendN = 0
-        self.recvN = 0
+        self.recvN = -1
 
     @staticmethod
     def _nonce(n: int) -> bytes:
         return b"\0" * 4 + n.to_bytes(8, "little") # generates a 12 byte number ( 0 0 0 0 )just filed with zeros (0 0 0 0 0 0 0 0) a simple counter little means less significant comes first
 
     def Encrypt(self, data:bytes, tag:bytes = b""):
-        ct = self.send.encrypt(self._nonce(self.sendN), data, tag) # here we encrypt data with the send key and tag (ct stands for "cyphertext")
-        self.sendN += 1
-        return ct
+        n = self.sendN # save the number used to build the nonce
+        self.sendN += 1 # increment
+        return n, self.send.encrypt(self._nonce(n), data, tag) # here we encrypt data with the send key and tag (ct stands for "cyphertext")
 
     def Decrypt(self, data:bytes,n ,tag:bytes = b""):
+        if not ( self.recvN < n < 2**64): # make sure we are not being replayed and below the limit
+            raise ReplayError("The message is being replayed or key is stale. rekey! ")
         dr = self.recv.decrypt(self._nonce(n), data, tag) # do the same as encrypt but backwards ("dr" stands for decryption result)
-        self.recvN = 1
-        return  dr
+        self.recvN = n
+        return dr
 
 class ASHTPServer:
     def __init__(self,
+                 application:type[FastAPI],
                  server_private_encryption_const: bytes,
-                 key_authority: type[IKeyAuthority],
-                 application_name: str = "ASHTP-Service",
-                 port: int = 80,
-                 host:str = "127.0.0.1",
+                 key_authority: ika,
                  url_prefix: str = "http://",
                  url_health: str = "/health",
                  url_handshake: str = "/privet",
@@ -86,9 +84,6 @@ class ASHTPServer:
         self._version: str = "ashtp 1"
 
         # ---------- server address ----------
-        self.appName = application_name
-        self.serverPort: int = port
-        self.ServerIp:str = host
         self.serverPrefix: str = url_prefix
         self.serverHealthEndpoint: str = url_health
         self.serverHandshakeEndpoint: str = url_handshake
@@ -96,7 +91,7 @@ class ASHTPServer:
 
         # ---------- file transfer ----------
         self._tmp = Path(tempfile.gettempdir()) / "ashtp" / "S"
-        self._tmp.mkdir(exist_ok=True)
+        self._tmp.mkdir(parents=True, exist_ok=True)
 
         # ---------- crypto / handshake ----------
         self.sb: bytes = server_private_encryption_const  # server's constant private key
@@ -123,7 +118,7 @@ class ASHTPServer:
         self.logger = logging.getLogger(__name__)
 
         # --------- app ---------
-        self.app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+        self.app = application
         self.app.add_api_route("/health", self.Health, methods=["GET"])
         self.app.add_api_route("/privet", self.Handshake, methods=["POST"])
         self.app.add_api_route("/auth", self.Authenticate, methods=["POST"])
@@ -164,13 +159,66 @@ class ASHTPServer:
             output[name] = value
         return output
 
+    def Expire(self, max_age: float = 10.0):
+        now = time.monotonic()
+        for sid, s in list(self.activeSessions.items()):
+            if s.permsLevel < self.keyAuthority.minPermissionLevel and now - s.created > max_age:
+                del self.activeSessions[sid]
+
+    def Seal(self, msg:dict, method:str, path:str, sessionId:bytes ):
+        """ Turns unencrypted JSON into request ready data
+
+        :param sessionId:
+        :param session:
+        :param msg:
+        :param method:
+        :param path:
+        :return:
+        """
+
+        sec = self.activeSessions[sessionId].session
+
+
+        plain = json.dumps(msg).encode()
+        tag = sessionId + method.encode() + b" " + path.encode()
+        n, data = sec.Encrypt(plain,tag)
+
+        headers = {
+            "X-Session": base64.b64encode(sessionId).decode(), # take session id make it into base64 and turn it into words
+            "X-Counter": str(n),# the counter needed for encryption/decryption
+            "Content-Type": "application/octet-stream",#the thing saying basicly we have random binary bs onboard (octet = byte)
+        }
+
+        return data, headers
+
+    def TearOpen(self, msg:bytes, method:str, path:str, clientCount:int, sessionId:bytes) -> dict:
+        """
+        Turns encrypt byte data into (hopefuly) a readable JSON
+
+        :param serverCount:
+        :param msg:
+        :param method:
+        :param path:
+        :param session:
+        :param sessionId:
+        :return:
+        """
+        sec = self.activeSessions[sessionId].session
+
+        path = path if path.startswith("/") else "/" + path
+        n = clientCount
+        tag = sessionId + method.encode() + b" " + path.encode()
+        plain  = sec.Decrypt(msg, n, tag)
+
+        return json.loads(plain.decode())
+
     # ------------ endpoints --------------
 
     async def Health(self):
         return {"status": "success", "code": 200, "message": "ok"}
 
     async def Handshake(self, request: Request):
-        _Expire(self) # remove old sessions to prevent overflow
+        self.Expire() # remove old sessions to prevent overflow
         try:
             req = await request.json()
             req = self.Parse(req, self.HELLO_FORMAT)
@@ -201,11 +249,11 @@ class ASHTPServer:
             c2s, s2c = _DeriveKeys(sE + fE, proto.encode("utf-8") + key_id + Eb + Fb + self.Sb)
             session = Session(s2c, c2s)
             self.activeSessions[sessionId] = ActiveSession(session)
-
+            n, ct = session.Encrypt(b"lets go", b"")
             reply = {
                 "F":          base64.b64encode( Fb ).decode(),
                 "session_id": base64.b64encode( sessionId ).decode(),
-                "ok":         base64.b64encode( session.Encrypt(b"lets go", b"") ).decode()
+                "ok":         base64.b64encode( ct ).decode()
             }
             return reply
         except (ValueError, ParsingError, HandshakeError) as e:
@@ -214,63 +262,32 @@ class ASHTPServer:
 
     async def Authenticate(self, request: Request):
         try:
-            req = await request.json()
-            req = self.Parse(req, self.AUTH_FORMAT)
-            #TODO add authentication with the key authority
+            raw = await request.body()
 
-        except (ValueError, ParsingError, HandshakeError) as e:
+            sid = base64.b64decode(request.headers["X-Session"])
+            active = self.activeSessions.get(sid)
+            if active is None:
+                raise HandshakeError("unknown session")
+
+            count = int(request.headers["X-Counter"])
+
+            req = self.TearOpen(raw, "POST", self.serverAuthEndpoint, count, sid)
+            req = self.Parse(req, self.AUTH_FORMAT)
+
+            apiKey = req["api_key"]
+            permissionLevel = self.keyAuthority.CheckPerms(apiKey)
+            if permissionLevel >= self.keyAuthority.minPermissionLevel:
+                active.permsLevel = permissionLevel
+
+                data, headers = self.Seal({"ok": "ok"}, "POST", self.serverAuthEndpoint, sid)
+                return Response(content=data, headers=headers, media_type="application/octet-stream")
+            else:
+                self.activeSessions.pop(sid)
+                raise HandshakeError("Key dosen't have enough permissions or dosen't match")
+
+
+        except (KeyError, ValueError, ParsingError, HandshakeError, ReplayError, InvalidTag) as e:
             self.Error(str(e))
             return Response(status_code=400)
 
 
-    def Seal(self, msg:dict, method:str, path:str, session:Session|None = None, sessionId:bytes|None = None ):
-        """ Turns unencrypted JSON into request ready data
-
-        :param sessionId:
-        :param session:
-        :param msg:
-        :param method:
-        :param path:
-        :return:
-        """
-
-        sec = session if session is not None else self.session
-        secId = sessionId if sessionId is not None else self.sessionId
-
-        n = sec.sendN
-        plain = json.dumps(msg).encode()
-        tag = secId + method.encode() + b" " + path.encode()
-        data = sec.Encrypt(plain,tag)
-
-        headers = {
-            "X-Session": base64.b64encode(secId).decode(), # take session id make it into base64 and turn it into words
-            "X-Counter": str(n),# the counter needed for encryption/decryption
-            "Content-Type": "application/octet-stream",#the thing saying basicly we have random binary bs onboard (octet = byte)
-        }
-
-        return data, headers
-
-    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None ) -> dict:
-        """
-        Turns encrypt byte data into (hopefuly) a readable JSON
-
-        :param serverCount:
-        :param msg:
-        :param method:
-        :param path:
-        :param session:
-        :param sessionId:
-        :return:
-        """
-        sec = session if session is not None else self.session
-        secId = sessionId if sessionId is not None else self.sessionId
-
-        if sec is None or secId is None:
-            raise HandshakeError("no active session")
-
-        path = path if path.startswith("/") else "/" + path
-        n = serverCount
-        tag = secId + method.encode() + b" " + path.encode()
-        plain  = sec.Decrypt(msg, n, tag)
-
-        return json.loads(plain.decode())

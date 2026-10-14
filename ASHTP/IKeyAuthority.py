@@ -1,6 +1,9 @@
 from abc import ABC, abstractmethod
 
-class KeyAuthority(ABC):
+class IKeyAuthority(ABC):
+    @property
+    @abstractmethod
+    def minPermissionLevel(self) -> int: ...
 
     @abstractmethod
     async def CheckPerms(self, apiKey: str) -> int:

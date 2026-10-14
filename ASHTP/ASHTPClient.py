@@ -25,6 +25,9 @@ class HandshakeError(Exception):
 class ParsingError(Exception):
     pass
 
+class ReplayError(Exception):
+    pass
+
 
 def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,bytes]:
     symKey = HKDF(algorithm=hashes.SHA256(), length=length, salt=None,
@@ -36,21 +39,23 @@ class Session():
         self.send = ChaCha20Poly1305(send_key)
         self.recv = ChaCha20Poly1305(recv_key)
         self.sendN = 0
-        self.recvN = 0
+        self.recvN = -1
 
     @staticmethod
     def _nonce(n: int) -> bytes:
         return b"\0" * 4 + n.to_bytes(8, "little") # generates a 12 byte number ( 0 0 0 0 )just filed with zeros (0 0 0 0 0 0 0 0) a simple counter little means less significant comes first
 
     def Encrypt(self, data:bytes, tag:bytes = b""):
-        ct = self.send.encrypt(self._nonce(self.sendN), data, tag) # here we encrypt data with the send key and tag (ct stands for "cyphertext")
-        self.sendN += 1
-        return ct
+        n = self.sendN # save the number used to build the nonce
+        self.sendN += 1 # increment
+        return n, self.send.encrypt(self._nonce(n), data, tag) # here we encrypt data with the send key and tag (ct stands for "cyphertext")
 
     def Decrypt(self, data:bytes,n ,tag:bytes = b""):
+        if not ( self.recvN < n < 2**64): # make sure we are not being replayed and below the limit
+            raise ReplayError("The message is being replayed or key is stale. rekey! ")
         dr = self.recv.decrypt(self._nonce(n), data, tag) # do the same as encrypt but backwards ("dr" stands for decryption result)
-        self.recvN = 1
-        return  dr
+        self.recvN = n
+        return dr
 
 class ASHTPClient:
     def __init__(self,
@@ -189,15 +194,14 @@ class ASHTPClient:
         sec = session if session is not None else self.session
         secId = sessionId if sessionId is not None else self.sessionId
 
-        n = sec.sendN
         plain = json.dumps(msg).encode()
         tag = secId + method.encode() + b" " + path.encode()
-        data = sec.Encrypt(plain,tag)
+        n, data = sec.Encrypt(plain,tag)
 
         headers = {
             "X-Session": base64.b64encode(secId).decode(), # take session id make it into base64 and turn it into words
             "X-Counter": str(n),# the counter needed for encryption/decryption
-            "Content-Type": "application/octet-stream",#the thing saying basicly we have random binary bs onboard (octet = byte)
+            "Content-Type": "application/octet-stream", # the thing saying basicly we have random binary bs onboard (octet = byte)
         }
 
         return data, headers
@@ -288,7 +292,10 @@ class ASHTPClient:
                                                data=authBytes, headers=headers, timeout=self.timeoutTime)
                 resp.raise_for_status()
                 serverCounter= int(resp.headers["X-Counter"])
-                resp = self.TearOpen(resp, "POST", "/auth",serverCounter ,session, reply["session_id"])
+                resp = self.TearOpen(resp, "POST", "/auth", serverCounter ,session, reply["session_id"])
+
+                resp = self.Parse(resp, self.AUTH_REPLY_FORMAT)
+                if not resp.get("ok") == "ok": raise HandshakeError("couldnt log in")
 
             except Exception as e:
                 self.Error(f"Handshake Failed: {e}")
