@@ -34,6 +34,14 @@ def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,byt
                   info=b"ashtp sym sesscion key" + transcrypt).derive(secret)
     return symKey[32:], symKey[:32]
 
+def _aad(sid: bytes, method: str, endpoint: str, ref: int | None = None) -> bytes:
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    a = sid + method.upper().encode() + b" " + endpoint.encode()
+    if ref is not None:
+        a += b" " + ref.to_bytes(8, "little")   # fixed width at the end, so unambiguous
+    return a
+
 class Session():
     def __init__(self, send_key:bytes, recv_key:bytes):
         self.send = ChaCha20Poly1305(send_key)
@@ -180,9 +188,10 @@ class ASHTPClient:
             output[name] = value
         return output
 
-    def Seal(self, msg:dict, method:str, path:str, session:Session|None = None, sessionId:bytes|None = None ):
+    def Seal(self, msg:dict, method:str, path:str, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None  ):
         """ Turns unencrypted JSON into request ready data
 
+        :param ref:
         :param sessionId:
         :param session:
         :param msg:
@@ -195,7 +204,7 @@ class ASHTPClient:
         secId = sessionId if sessionId is not None else self.sessionId
 
         plain = json.dumps(msg).encode()
-        tag = secId + method.encode() + b" " + path.encode()
+        tag = _aad(sessionId, method, path, ref=ref)
         n, data = sec.Encrypt(plain,tag)
 
         headers = {
@@ -204,12 +213,13 @@ class ASHTPClient:
             "Content-Type": "application/octet-stream", # the thing saying basicly we have random binary bs onboard (octet = byte)
         }
 
-        return data, headers
+        return data, headers, n
 
-    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None ) -> dict:
+    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None  ) -> dict:
         """
         Turns encrypt byte data into (hopefuly) a readable JSON
 
+        :param ref:
         :param serverCount:
         :param msg:
         :param method:
@@ -226,7 +236,7 @@ class ASHTPClient:
 
         path = path if path.startswith("/") else "/" + path
         n = serverCount
-        tag = secId + method.encode() + b" " + path.encode()
+        tag = _aad(sessionId, method, path, ref=ref)
         plain  = sec.Decrypt(msg, n, tag)
 
         return json.loads(plain.decode())
@@ -275,7 +285,7 @@ class ASHTPClient:
                 F = reply["F"]
                 eF = e.exchange(X25519PublicKey.from_public_bytes(F)) # exchange keys to get the secret number (mix our private with servers public)
 
-                c2s, s2c = _DeriveKeys(eS + eF, proto + key_id + Eb + F + self.Sb)
+                c2s, s2c = _DeriveKeys(eS + eF, proto + key_id + Eb + F + self.Sb + reply["session_id"])
                 session = Session(c2s, s2c)
 
                 if session.Decrypt(reply["ok"],0, b"") != b"lets go":
@@ -287,12 +297,12 @@ class ASHTPClient:
             try:
                 authPackage = { "api_key":api_key }
 
-                authBytes, headers = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
+                authBytes, headers, n = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
                 resp = await asyncio.to_thread(requests.post, f"{self.serverUrl}{self.serverAuthEndpoint}",
                                                data=authBytes, headers=headers, timeout=self.timeoutTime)
                 resp.raise_for_status()
                 serverCounter= int(resp.headers["X-Counter"])
-                resp = self.TearOpen(resp.contents, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"])
+                resp = self.TearOpen(resp.contents, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"], ref=n)
 
                 resp = self.Parse(resp, self.AUTH_REPLY_FORMAT)
                 if not resp.get("ok") == "ok": raise HandshakeError("couldnt log in")

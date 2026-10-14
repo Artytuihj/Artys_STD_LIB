@@ -36,6 +36,14 @@ def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,byt
                   info=b"ashtp sym sesscion key" + transcrypt).derive(secret)
     return symKey[32:], symKey[:32]
 
+def _aad(sid: bytes, method: str, endpoint: str, ref: int | None = None) -> bytes:
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+    a = sid + method.upper().encode() + b" " + endpoint.encode()
+    if ref is not None:
+        a += b" " + ref.to_bytes(8, "little")   # fixed width at the end, so unambiguous
+    return a
+
 
 @dataclass
 class ActiveSession:
@@ -165,9 +173,10 @@ class ASHTPServer:
             if s.permsLevel < self.keyAuthority.minPermissionLevel and now - s.created > max_age:
                 del self.activeSessions[sid]
 
-    def Seal(self, msg:dict, method:str, path:str, sessionId:bytes ):
+    def Seal(self, msg:dict, method:str, path:str, sessionId:bytes, ref:int|None = None ):
         """ Turns unencrypted JSON into request ready data
 
+        :param ref:
         :param sessionId:
         :param session:
         :param msg:
@@ -180,7 +189,7 @@ class ASHTPServer:
 
 
         plain = json.dumps(msg).encode()
-        tag = sessionId + method.encode() + b" " + path.encode()
+        tag = _aad(sessionId, method, path, ref=ref)
         n, data = sec.Encrypt(plain,tag)
 
         headers = {
@@ -189,12 +198,13 @@ class ASHTPServer:
             "Content-Type": "application/octet-stream",#the thing saying basicly we have random binary bs onboard (octet = byte)
         }
 
-        return data, headers
+        return data, headers, n
 
-    def TearOpen(self, msg:bytes, method:str, path:str, clientCount:int, sessionId:bytes) -> dict:
+    def TearOpen(self, msg:bytes, method:str, path:str, clientCount:int, sessionId:bytes,ref:int|None = None) -> dict:
         """
         Turns encrypt byte data into (hopefuly) a readable JSON
 
+        :param ref:
         :param serverCount:
         :param msg:
         :param method:
@@ -207,7 +217,7 @@ class ASHTPServer:
 
         path = path if path.startswith("/") else "/" + path
         n = clientCount
-        tag = sessionId + method.encode() + b" " + path.encode()
+        tag = _aad(sessionId, method, path, ref=ref)
         plain  = sec.Decrypt(msg, n, tag)
 
         return json.loads(plain.decode())
@@ -246,7 +256,7 @@ class ASHTPServer:
 
             fE = f.exchange(X25519PublicKey.from_public_bytes(Eb))
 
-            c2s, s2c = _DeriveKeys(sE + fE, proto.encode("utf-8") + key_id + Eb + Fb + self.Sb)
+            c2s, s2c = _DeriveKeys(sE + fE, proto.encode() + key_id + Eb + Fb + self.Sb + sessionId)
             session = Session(s2c, c2s)
             self.activeSessions[sessionId] = ActiveSession(session)
             n, ct = session.Encrypt(b"lets go", b"")
@@ -279,7 +289,7 @@ class ASHTPServer:
             if permissionLevel >= self.keyAuthority.minPermissionLevel:
                 active.permsLevel = permissionLevel
 
-                data, headers = self.Seal({"ok": "ok"}, "POST", self.serverAuthEndpoint, sid)
+                data, headers, n = self.Seal({"ok": "ok"}, "POST", self.serverAuthEndpoint, sid, count)
                 return Response(content=data, headers=headers, media_type="application/octet-stream")
             else:
                 self.activeSessions.pop(sid)
