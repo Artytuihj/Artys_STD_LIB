@@ -265,9 +265,9 @@ class ASHTPClient:
                 resp = await asyncio.to_thread(requests.post, f"{self.serverUrl}{self.serverHandshakeEndpoint}",
                                                json = hello, timeout = self.timeoutTime)
                 resp.raise_for_status() # neat thing it raises when bad status arrives like 500 or 404
-            except Exception as e:
+            except Exception as err:
                 self.failedRequests += 1
-                self.Error(str(e))
+                self.Error(str(err))
                 continue
 
             try:
@@ -281,24 +281,24 @@ class ASHTPClient:
                 if session.Decrypt(reply["ok"],0, b"") != b"lets go":
                     raise HandshakeError("<ok> didnt match the expected! keys/ package are either malformed or where tampered with")
 
-            except (HandshakeError, InvalidTag, ValueError) as e:
-                self.Error(f"Handshake Failed: {e}")
+            except (HandshakeError, InvalidTag, ValueError) as err:
+                self.Error(f"Handshake Failed: {err}")
                 return False
             try:
                 authPackage = { "api_key":api_key }
 
-                authBytes, headers = self.Seal(authPackage, "POST", "/auth", session, reply["session_id"])
+                authBytes, headers = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
                 resp = await asyncio.to_thread(requests.post, f"{self.serverUrl}{self.serverAuthEndpoint}",
                                                data=authBytes, headers=headers, timeout=self.timeoutTime)
                 resp.raise_for_status()
                 serverCounter= int(resp.headers["X-Counter"])
-                resp = self.TearOpen(resp, "POST", "/auth", serverCounter ,session, reply["session_id"])
+                resp = self.TearOpen(resp.contents, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"])
 
                 resp = self.Parse(resp, self.AUTH_REPLY_FORMAT)
                 if not resp.get("ok") == "ok": raise HandshakeError("couldnt log in")
 
-            except Exception as e:
-                self.Error(f"Handshake Failed: {e}")
+            except Exception as err:
+                self.Error(f"Handshake Failed: {err}")
                 return False
 
 
