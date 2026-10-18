@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import secrets
 import tempfile
-from operator import length_hint
 from typing import TYPE_CHECKING
 from pathlib import Path
 import requests
@@ -20,7 +19,7 @@ from cryptography.exceptions import InvalidTag
 from ASHTP import ashtpVersion
 
 if TYPE_CHECKING:
-    from Automation.ArtysEventManager import ArtysEventManager
+    from Automation.ArtysEventManager import ArtysEventManager #!!!!!!!!!!!!!!!!!! change this every time to relative path!!!!!!!!!!!!!!!!!
 
 class HandshakeError(Exception):
     pass
@@ -82,7 +81,6 @@ class ASHTPClient:
                  url_auth: str = "/auth",
                  timeout_time: int = 5,
                  max_reties: int = 5,
-                 health_polling_enabled: bool = False,
                  health_poll_rate: int = 5,
                  event_mngr: type[ArtysEventManager] | None = None):
 
@@ -107,7 +105,6 @@ class ASHTPClient:
         self.maxRequestRetries: int = max_reties
 
         # ---------- health polling settings ----------
-        self.healthPollingEnabled: bool = health_polling_enabled
         self.healthCheckRate: int = health_poll_rate
 
         # ---------- file transfer ----------
@@ -138,15 +135,8 @@ class ASHTPClient:
         self.sessionId:bytes = b""
 
         # ---------- runtime state ----------
-        self.isOnline: bool = not health_polling_enabled
+        self.isOnline: bool = False
         self.failedRequests: int = 0
-
-        # ---------- background tasks (keep last, they use everything above) ----------
-        self._healthTask = None
-        if health_polling_enabled:
-            self._healthTask = asyncio.create_task(self.CheckHealth())
-
-
 
 
     def Log(self, message:str):
