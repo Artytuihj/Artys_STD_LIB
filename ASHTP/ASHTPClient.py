@@ -400,6 +400,7 @@ class ASHTPClient:
 
 
     async def GetFile(self, endPoint:str, request:dict=None, headers:dict = {}) -> dict:
+        raise NotImplemented
         """
                 Streams a file from the server.
                 Can only be used to request files!
@@ -459,7 +460,9 @@ class ASHTPClient:
 
         return {"status": "failed", "code": "000", "message": str(last_error)}
 
+    # TODO implement this bs pls
     async def PostFile(self, endPoint: str, file:Path,headers:dict = {}) -> dict:
+        raise NotImplemented
         """
         Posts file to the server.
         Can only be used to upload files
@@ -495,4 +498,4 @@ class ASHTPClient:
                 except Exception as e:
                     last_error = e
 
-        return {"status": "failed", "code": "000", "message": str(last_error)}
+        return {"status": "failed", "code": "000", "message": str(last_error)}#TOD
