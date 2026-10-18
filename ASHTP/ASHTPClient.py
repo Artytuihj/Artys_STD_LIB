@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import tempfile
 from operator import length_hint
 from typing import TYPE_CHECKING
@@ -26,6 +27,9 @@ class ParsingError(Exception):
     pass
 
 class ReplayError(Exception):
+    pass
+
+class ASHTPGeneralException(Exception):
     pass
 
 
@@ -78,7 +82,6 @@ class ASHTPClient:
                  max_reties: int = 5,
                  health_polling_enabled: bool = False,
                  health_poll_rate: int = 5,
-                 included_headers: dict | None = None,
                  event_mngr: type[ArtysEventManager] | None = None):
 
         # ----------------------------------------------
@@ -100,7 +103,6 @@ class ASHTPClient:
         # ---------- request behaviour ----------
         self.timeoutTime: int = timeout_time
         self.maxRequestRetries: int = max_reties
-        self.persistentHeaders: dict = included_headers or {}
 
         # ---------- health polling settings ----------
         self.healthPollingEnabled: bool = health_polling_enabled
@@ -130,7 +132,6 @@ class ASHTPClient:
             "ok": {"type": str, "required": True}
         }
         self.secureTunnelActive = False
-        self.encryptionKey = ""
         self.session:Session = None
         self.sessionId:bytes = b""
 
@@ -316,6 +317,7 @@ class ASHTPClient:
 
             self.session = session
             self.sessionId = reply["session_id"]
+            self.secureTunnelActive = True
             self.isOnline = True
             self.failedRequests = 0
             self.emit("ashtp_server_status_changed", True)
@@ -343,93 +345,59 @@ class ASHTPClient:
             prev = self.isOnline
             if self.failedRequests > self.maxRequestRetries:
                 self.isOnline = False
+                self.secureTunnelActive = False
             elif self.failedRequests == 0:
                 self.isOnline = True
             if self.isOnline != prev:
                 self.emit("ashtp_server_status_changed", self.isOnline)
             await asyncio.sleep(self.healthCheckRate)
 
-
-    async def GetData(self, endPoint:str, request:dict=None, timeout:float = 0, headers:dict = {}) -> dict:
-
-        """
-        Requests JSON data from the server.
-        Can not be used to request files!
-
-        :param headers:
-        :param timeout:
-        :param endPoint:
-        :param request:
-        :return: response
-        """
-
+    async def _request(self, method: str, path: str, request: dict | None, timeout, usrHeaders, sendBody: bool = True) -> dict:
         if not self.isOnline:
-            return {"status": "failed", "code": "400", "message": "server is offline"}
+            raise ASHTPGeneralException("Server is offline")
+        if not self.secureTunnelActive:
+            raise ASHTPGeneralException("No active tunnel")
 
-        if not self.isOnline:
-            return {"status": "failed", "code": "400", "message": "a secure connection to the server was not established"}
+        timeout = self.timeoutTime if timeout is None else timeout
+        path = path if path.startswith("/") else "/" + path
+        url = f"{self.serverUrl}{path}"
+        payload = request if request is not None else {"placeholder": secrets.randbits(64)}
 
-        if timeout == 0:
-            timeout = self.timeoutTime
-
-        headers = self.persistentHeaders | headers
-        combinedUrl = f"{self.serverUrl}{endPoint if endPoint.startswith("/") else "/" + endPoint}"
-        kwargs = {"headers":headers, "timeout": timeout}
         last_error = ""
-
-        if request is not None:
-            kwargs["json"] = request
-
-        for attempt in range(0,self.maxRequestRetries):
+        for attempt in range(self.maxRequestRetries):
+            data, headers, n = self.Seal(payload, method, path)
+            kwargs = {"headers": (usrHeaders or {}) | headers, "timeout": timeout}
+            if sendBody:
+                kwargs["data"] = data
             try:
-                resp = await asyncio.to_thread(requests.get, combinedUrl, **kwargs)
+                resp = await asyncio.to_thread(requests.request, method, url, **kwargs)
                 resp.raise_for_status()
-                response = resp.json()
-
+            except requests.exceptions.HTTPError as e:
+                self.failedRequests += 1
+                last_error = str(e)
+                if e.response is not None and e.response.status_code < 500:
+                    raise ASHTPGeneralException(last_error) from e
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                self.failedRequests += 1
+                last_error = str(e)
+            else:
+                try:
+                    counter = int(resp.headers["X-Counter"])
+                except (KeyError, ValueError) as e:
+                    raise ASHTPGeneralException("bad X-Counter") from e
+                response = self.TearOpen(resp, method, path, counter, ref=n)
                 self.failedRequests = 0
                 return response
-            except Exception as e:
-                last_error = e
+            await asyncio.sleep(min(0.25 * 2 ** attempt, 5)) # exponentialy wait longer each time we fail to not hammer the server
 
-        return {"status": "failed", "code": "000", "message": str(last_error)}
+        raise ASHTPGeneralException(last_error)
 
-    async def PostData(self, endPoint:str, request:dict, timeout:float = 0, headers:dict = {}) -> dict:
-        """
-        Post JSON data to the server.
-        Can not be used to upload files
+    async def GetData(self, path, request=None, timeout=None, usrHeaders=None):
+        return await self._request("GET", path, request, timeout, usrHeaders, sendBody=request is not None)
 
-        :param timeout:
-        :param endPoint:
-        :param request:
-        :return: response
-        """
+    async def PostData(self, path, request, timeout=None, usrHeaders=None):
+        return await self._request("POST", path, request, timeout, usrHeaders)
 
-        if not self.isOnline:
-            return {"status": "failed", "code": "400", "message": "server is offline"}
-
-        if not self.isOnline:
-            return {"status": "failed", "code": "400", "message": "a secure connection to the server was not established"}
-
-        if timeout == 0:
-            timeout = self.timeoutTime
-
-        combinedUrl = f"{self.serverUrl}{endPoint if endPoint.startswith("/") else "/" + endPoint}"
-        last_error = ""
-
-        for i in range(0, self.maxRequestRetries):
-            try:
-                resp = await asyncio.to_thread(requests.post, combinedUrl,
-                                               headers = self.persistentHeaders | headers,
-                                               timeout = timeout,
-                                               json = request)
-                resp.raise_for_status()
-                response = resp.json()
-                self.failedRequests = 0
-                return response
-            except Exception as e:
-                last_error = e
-
-        return {"status":"failed", "code":"000", "message": str(last_error)}
 
     async def GetFile(self, endPoint:str, request:dict=None, headers:dict = {}) -> dict:
         """
