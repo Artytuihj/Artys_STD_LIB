@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import json
 import tempfile
 import time
@@ -15,10 +14,11 @@ import base64
 import hashlib
 from fastapi import FastAPI, Request, Response
 import logging
-import IKeyAuthority
+
 from dataclasses import dataclass, field
 import secrets
 from IKeyAuthority import IKeyAuthority as ika
+
 
 class HandshakeError(Exception):
     pass
@@ -28,7 +28,6 @@ class ParsingError(Exception):
 
 class ReplayError(Exception):
     pass
-
 
 
 def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,bytes]:
@@ -73,6 +72,7 @@ class Session():
         dr = self.recv.decrypt(self._nonce(n), data, tag) # do the same as encrypt but backwards ("dr" stands for decryption result)
         self.recvN = n
         return dr
+
 
 class ASHTPServer:
     def __init__(self,
