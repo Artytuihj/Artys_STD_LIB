@@ -17,6 +17,8 @@ import logging
 
 from dataclasses import dataclass, field
 import secrets
+
+from ASHTP import ashtpVersion
 from IKeyAuthority import IKeyAuthority as ika
 
 
@@ -89,7 +91,7 @@ class ASHTPServer:
         # ----------------------------------------------
 
         # ---------- protocol ----------
-        self._version: str = "ashtp 1"
+        self._version: str = ashtpVersion
 
         # ---------- server address ----------
         self.serverPrefix: str = url_prefix

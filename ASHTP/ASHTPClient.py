@@ -17,6 +17,8 @@ import base64
 import hashlib
 from cryptography.exceptions import InvalidTag
 
+from ASHTP import ashtpVersion
+
 if TYPE_CHECKING:
     from Automation.ArtysEventManager import ArtysEventManager
 
@@ -89,7 +91,7 @@ class ASHTPClient:
         # ----------------------------------------------
 
         # ---------- protocol ----------
-        self._version: str = "ashtp 1"
+        self._version: str = ashtpVersion
 
         # ---------- server address ----------
         self.serverIp: str = server_ip
