@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import time
+from collections import deque  #&&&&&
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -14,12 +16,13 @@ import base64
 import hashlib
 from fastapi import FastAPI, Request, Response
 import logging
+import inspect
 
 from dataclasses import dataclass, field
 import secrets
 
 from ASHTP import ashtpVersion
-from IKeyAuthority import IKeyAuthority as ika
+from ASHTP.IKeyAuthority import IKeyAuthority as ika
 
 
 class HandshakeError(Exception):
@@ -29,6 +32,8 @@ class ParsingError(Exception):
     pass
 
 class ReplayError(Exception):
+    pass
+class BodyTooLarge(Exception):
     pass
 
 
@@ -45,12 +50,47 @@ def _aad(sid: bytes, method: str, endpoint: str, ref: int | None = None) -> byte
         a += b" " + ref.to_bytes(8, "little")   # fixed width at the end, so unambiguous
     return a
 
+async def _ReadBody(req: Request, limit: int) -> bytes:
+    cl = req.headers.get("content-length")
+    if cl is not None and int(cl) > limit:
+        raise BodyTooLarge
+    buf = bytearray()
+    async for chunk in req.stream():
+        buf += chunk
+        if len(buf) > limit:
+            raise BodyTooLarge
+    return bytes(buf)
+
+
+class RateLimiter:#neat  thingy
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
+        self.window = window
+        self.hits: dict[str, deque[float]] = {} # store key and a queue of req attempts
+
+    def _Trim(self, key: str) -> deque:
+        q = self.hits.setdefault(key, deque()) # get the queue from the dict and if dosent exist yet make it
+        now = time.monotonic()
+        while q and now - q[0] > self.window: # repeat while q is a thing and q[0] fits within the window
+            q.popleft()
+        return q
+
+    def Count(self, key: str) -> int:#remove stale requests
+        return len(self._Trim(key))
+
+    def Blocked(self, key: str) -> bool:
+        return self.Count(key) >= self.limit# call count and check if we are over the limit
+
+    def Hit(self, key: str):
+        self._Trim(key).append(time.monotonic())# add to the counter
 
 @dataclass
 class ActiveSession:
     session: Session
     created: float = field(default_factory=time.monotonic)
-    permsLevel: int = 0
+    permsLevel: int = -1
+    name: str = "None"
+
 
 class Session():
     def __init__(self, send_key:bytes, recv_key:bytes):
@@ -124,6 +164,11 @@ class ASHTPServer:
         self.activeSessions: dict[bytes,ActiveSession] = {}
         self.keyAuthority = key_authority
 
+        # ---------- abuse limits ----------
+        self.hsLimit = RateLimiter(limit=300, window=60)
+        self.authFails = RateLimiter(limit=50, window=300)
+        self.maxSessions = 200
+
         # --------- other ------------
         self.logger = logging.getLogger(__name__)
 
@@ -155,6 +200,7 @@ class ASHTPServer:
             if name not in msg:
                 if spec["required"]:
                     raise ParsingError("msg is missing keys defined in template")
+                continue
             value = msg[name]
             if spec["type"] is bytes:
                 try:
@@ -172,8 +218,9 @@ class ASHTPServer:
     def Expire(self, max_age: float = 10.0):
         now = time.monotonic()
         for sid, s in list(self.activeSessions.items()):
-            if s.permsLevel < self.keyAuthority.minPermissionLevel and now - s.created > max_age:
+            if s.permsLevel == -1 and now - s.created > max_age:
                 del self.activeSessions[sid]
+
 
     def Seal(self, msg:dict, method:str, path:str, sessionId:bytes, ref:int|None = None ):
         """ Turns unencrypted JSON into request ready data
@@ -187,7 +234,10 @@ class ASHTPServer:
         :return:
         """
 
-        sec = self.activeSessions[sessionId].session
+        try:
+            sec = self.activeSessions[sessionId].session
+        except KeyError:
+            raise KeyError("[ASHTP] Tried using expired session")
 
 
         plain = json.dumps(msg).encode()
@@ -224,26 +274,75 @@ class ASHTPServer:
 
         return json.loads(plain.decode())
 
+    def Endpoint(self, path:str, method:str, minPerms:int|None = None, maxBody:int = 16 * 1024):
+        method = method.upper()
+
+        def decorator(fn):
+            async def endpoint(req:Request):
+                # unpack the request
+                try:
+                    sid = base64.b64decode(req.headers["X-Session"])
+                    active = self.activeSessions.get(sid)
+                    requiredPermissionLevel = self.keyAuthority.minPermissionLevel if minPerms is None else minPerms
+
+
+                    if active is None or active.permsLevel > requiredPermissionLevel or active.permsLevel < 0:
+                        return Response(status_code=403)
+
+                    counter = int(req.headers["X-Counter"])
+
+                    contents = self.TearOpen(await _ReadBody(req, maxBody), method, path, counter, sid)
+                except (KeyError, ValueError, ReplayError, InvalidTag) as e:
+                    self.Error(f"{path}: {e}")
+                    return Response(status_code=400)
+                except BodyTooLarge:
+                    return Response(status_code=413)
+
+                # handle request
+                try:
+                    if inspect.iscoroutinefunction(fn):
+                        result = await fn(active, contents)
+                    else:
+                        result = await asyncio.to_thread(fn, active, contents)
+                except Exception as e:
+                    self.Error(f"{path} handler failed: {e}")
+                    result = {"status": "error", "code": 500, "message": "internal error"}
+                try:
+                    data, headers, _ = self.Seal(result, method, path, sid, ref=counter)
+                    return Response(content=data, headers=headers, media_type="application/octet-stream")
+                except KeyError as e:
+                    self.Log(str(e))
+                    return Response(status_code=401)
+
+            self.app.add_api_route(path, endpoint, methods=[method])
+            return fn
+        return decorator
+
+
     # ------------ endpoints --------------
 
     async def Health(self):
-        return {"status": "success", "code": 200, "message": "ok"}
+        return {"code": 200, "message": "ok"}
 
     async def Handshake(self, request: Request):
+        if self.hsLimit.Blocked("*"):
+            return Response(status_code=429, headers={"Retry-After": "60"})
+        self.hsLimit.Hit("*")
         self.Expire() # remove old sessions to prevent overflow
         try:
-            req = await request.json()
-            req = self.Parse(req, self.HELLO_FORMAT)
+            body = await _ReadBody(request, 1024)
+            raw = self.Parse(json.loads(body), self.HELLO_FORMAT)
 
-            proto = req["protocol"]
-            key_id = req["spk_hash"]
+
+            proto = raw["protocol"]
+            key_id = raw["spk_hash"]
 
             if proto != self._version: # check that the version matches
                 raise HandshakeError("Wrong handshake version")
             if key_id != hashlib.blake2b(self.Sb, digest_size=8).digest(): # check the key matches
                 raise HandshakeError("Wrong/old public key")
 
-            Eb = req["E"] # clients public bytes
+            Eb = raw["E"] # clients public bytes
 
             sE = self.s.exchange(X25519PublicKey.from_public_bytes(Eb))  # mix our const private with Clients public
 
@@ -260,7 +359,14 @@ class ASHTPServer:
 
             c2s, s2c = _DeriveKeys(sE + fE, proto.encode() + key_id + Eb + Fb + self.Sb + sessionId)
             session = Session(s2c, c2s)
-            self.activeSessions[sessionId] = ActiveSession(session)
+
+            if len(self.activeSessions) >= self.maxSessions:
+                unauth = [(s.created, k) for k, s in self.activeSessions.items() if s.permsLevel < 0]
+                if not unauth:
+                    return Response(status_code=503)
+                del self.activeSessions[min(unauth)[1]]
+
+            self.activeSessions[sessionId] = ActiveSession(session=session)
             n, ct = session.Encrypt(b"lets go", b"")
             reply = {
                 "F":          base64.b64encode( Fb ).decode(),
@@ -268,13 +374,15 @@ class ASHTPServer:
                 "ok":         base64.b64encode( ct ).decode()
             }
             return reply
+        except BodyTooLarge:
+            return Response(status_code=413)
         except (ValueError, ParsingError, HandshakeError) as e:
             self.Error(str(e))
             return Response(status_code=400)
 
     async def Authenticate(self, request: Request):
         try:
-            raw = await request.body()
+            raw = await _ReadBody(request, 2 * 1024)
 
             sid = base64.b64decode(request.headers["X-Session"])
             active = self.activeSessions.get(sid)
@@ -287,19 +395,22 @@ class ASHTPServer:
             req = self.Parse(req, self.AUTH_FORMAT)
 
             apiKey = req["api_key"]
-            permissionLevel = self.keyAuthority.CheckPerms(apiKey)
-            if permissionLevel >= self.keyAuthority.minPermissionLevel:
+            permissionLevel, name = self.keyAuthority.CheckPerms(apiKey)
+            if 0 <= permissionLevel <= self.keyAuthority.minPermissionLevel:
                 active.permsLevel = permissionLevel
+                active.name = name
 
                 data, headers, n = self.Seal({"ok": "ok"}, "POST", self.serverAuthEndpoint, sid, count)
                 return Response(content=data, headers=headers, media_type="application/octet-stream")
             else:
                 self.activeSessions.pop(sid)
+                self.authFails.Hit("*")
+                await asyncio.sleep(min(1 + 0.2 * self.authFails.Count("*"), 10))
                 raise HandshakeError("Key dosen't have enough permissions or dosen't match")
 
 
+        except BodyTooLarge:
+            return Response(status_code=413)
         except (KeyError, ValueError, ParsingError, HandshakeError, ReplayError, InvalidTag) as e:
             self.Error(str(e))
             return Response(status_code=400)
-
-

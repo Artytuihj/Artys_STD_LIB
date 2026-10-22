@@ -6,14 +6,15 @@ class IKeyAuthority(ABC):
     def minPermissionLevel(self) -> int: ...
 
     @abstractmethod
-    async def CheckPerms(self, apiKey: str) -> int:
+    def CheckPerms(self, apiKey: str) -> tuple[int, str]:
         """
         Look up an API key.
 
         Returns:
-            -1   the key was revoked
-             0   the key is not registered
-            >0   the key is valid (the number is the permission level of the key (if implemented) )
+            -1   the key is invalid
+             0   the key is system/admin
+            >0   any other permission
+        and the name of the key
         """
 
 
