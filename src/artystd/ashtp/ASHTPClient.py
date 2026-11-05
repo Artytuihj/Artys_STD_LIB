@@ -1,26 +1,29 @@
-from __future__ import annotations
-
+#std
 import json
 import secrets
 import tempfile
-import time  #$%%
-from typing import TYPE_CHECKING
+import time
+import zipfile
+from email import generator
 from pathlib import Path
-import requests
 import asyncio
+import logging
+import base64
+import hashlib
+from typing import Iterable, Iterator
+
+#pypi
+import requests
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives import hashes, serialization
-import logging
-import base64
-import hashlib
 from cryptography.exceptions import InvalidTag
+from requests import Response
 
-from ASHTP import ashtpVersion
-
-if TYPE_CHECKING:
-    from ArtysEventManager import ArtysEventManager
+#in module
+from src.artystd.ashtp import PROTOCOL_VERSION
+from src.artystd.utilities.ArtysEventManager import ArtysEventManager
 
 class HandshakeError(Exception):
     pass
@@ -82,15 +85,14 @@ class ASHTPClient:
                  url_auth: str = "/auth",
                  timeout_time: int = 5,
                  max_reties: int = 5,
-                 health_poll_rate: int = 5,
-                 event_mngr: type[ArtysEventManager] | None = None):
+                 health_poll_rate: int = 5):
 
         # ----------------------------------------------
         # |||  Arty's Secure HTTP Transport Protocol |||
         # ----------------------------------------------
 
         # ---------- protocol ----------
-        self._version: str = ashtpVersion
+        self._version: str = PROTOCOL_VERSION
 
         # ---------- server address ----------
         self.serverIp: str = server_ip
@@ -113,12 +115,6 @@ class ASHTPClient:
         self._tmp.mkdir(parents=True, exist_ok=True)
 
         # ---------- integrations (optional) ----------
-        self.emitEvents: bool = True if event_mngr else False
-
-        if self.emitEvents:
-            self.eventManager = event_mngr
-
-
         self.logger = logging.getLogger(__name__)
 
         # ---------- crypto / handshake ----------
@@ -152,10 +148,7 @@ class ASHTPClient:
         self.logger.error(message)
 
     def emit(self, event:str ,*args, **kwargs):
-        if self.emitEvents:
-            self.eventManager.EmitEvent(event, *args, **kwargs)
-        else:
-            return
+        ArtysEventManager.EmitEvent(event, *args, **kwargs)
 
 
     def Parse(self, msg: dict, fmt: dict)-> dict:
@@ -188,7 +181,7 @@ class ASHTPClient:
             output[name] = value
         return output
 
-    def Seal(self, msg:dict, method:str, path:str, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None  ):
+    def Seal(self, msg:bytes, method:str, path:str,session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> tuple[bytes, int]:
         """ Turns unencrypted JSON into request ready data
 
         :param ref:
@@ -205,17 +198,47 @@ class ASHTPClient:
 
         plain = json.dumps(msg).encode()
         tag = _aad(secId, method, path, ref=ref)
-        n, data = sec.Encrypt(plain,tag)
+        n, data = sec.Encrypt(plain, tag)
 
-        headers = {
-            "X-Session": base64.b64encode(secId).decode(), # take session id make it into base64 and turn it into words
-            "X-Counter": str(n),# the counter needed for encryption/decryption
-            "Content-Type": "application/octet-stream", # the thing saying basicly we have random binary bs onboard (octet = byte)
-        }
+        return data, n
 
-        return data, headers, n
+    def SealFileStream(self, meta:dict, filePath:Path, method:str, path:str, chunkSize:int=64*1024,
+                       session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> Iterator[tuple[bytes, int]]:
+        """ Turns an unencrypted File into request ready byte stream
 
-    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None  ) -> dict:
+        :param chunkSize:
+        :param filePath:
+        :param meta:
+        :param method:
+        :param path:
+        :param sessionId:
+        :param session:
+        :param ref:
+        :return:
+        """
+
+        sec = session if session is not None else self.session
+        secId = sessionId if sessionId is not None else self.sessionId
+        initialRequest = json.dumps( meta | {"chunk_size": chunkSize} ).encode()
+        with tempfile.TemporaryDirectory(dir=self._tmp) as td: # niche thing i like
+
+            zipPath = Path(td) / f"{filePath.name}.zip"
+            with zipfile.ZipFile(zipPath, "w", zipfile.ZIP_DEFLATED) as zf:
+                for file in filePath.rglob("*"):
+                    if file.is_dir():
+                        zf.write(file, arcname=str(file.relative_to(filePath)) + "/")
+                    else:
+                        zf.write(file, arcname=file.relative_to(filePath))
+
+            data, n = self.Seal(initialRequest, method, path, sec, secId, ref)
+            yield data, n
+
+            with zipPath.open("rb") as f:
+                while chunk := f.read(chunkSize):
+                    data, n = self.Seal(chunk, method, path, sec, secId, ref)
+                    yield data, n
+
+    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> dict:
         """
         Turns encrypt byte data into (hopefuly) a readable JSON
 
@@ -241,11 +264,10 @@ class ASHTPClient:
 
         return json.loads(plain.decode())
 
-
     async def Init(self,api_key:str) -> bool:
         """
         Initializes the connection with the server and creates the encrypted authenticated channel.
-        This function HAS to be used at the start of comunication with any server running the "ASHTP" protocol.
+        This function HAS to be used at the start of comunication with any server running the "ashtp" protocol.
         :param api_key:
         :return:
         """
@@ -296,13 +318,18 @@ class ASHTPClient:
                 self.Error(f"Handshake Failed: {err}")
                 return False
             try:
-                authPackage = { "api_key":api_key }
+                authPackage = json.dumps({ "api_key":api_key }).encode()
 
-                authBytes, headers, n = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
+                authBytes, n = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
+                headers = {
+                    "ashtp-Session": base64.b64encode(reply["session_id"]).decode(),    # take session id make it into base64 and turn it into words
+                    "ashtp-Counter": str(n),                                            # the counter needed for encryption/decryption
+                    "ashtp-Content": "json",                                            # content type
+                }
                 resp = await asyncio.to_thread(requests.post, f"{self.serverUrl}{self.serverAuthEndpoint}",
                                                data=authBytes, headers=headers, timeout=self.timeoutTime)
                 resp.raise_for_status()
-                serverCounter= int(resp.headers["X-Counter"])
+                serverCounter= int(resp.headers["ashtp-Counter"])
                 resp = self.TearOpen(resp.content, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"], ref=n)
 
                 resp = self.Parse(resp, self.AUTH_REPLY_FORMAT)
@@ -323,7 +350,6 @@ class ASHTPClient:
             self.emit("ashtp_server_status_changed", True)
             return True
         return False
-
 
     async def CheckHealth(self):
         combinedUrl = f"{self.serverUrl}{self.serverHealthEndpoint}"
@@ -365,8 +391,92 @@ class ASHTPClient:
 
             await asyncio.sleep(self.healthCheckRate)
 
+    async def _request(self, method: str, path: str, contentType:str, request: Iterable[bytes], timeout, usrHeaders:dict|None = None, sendBody: bool = True) -> dict:
+        if not self.isOnline:
+            raise ASHTPGeneralException("Server is offline")
+        if not self.secureTunnelActive:
+            raise ASHTPGeneralException("No active tunnel")
 
-    async def _request(self, method: str, path: str, request: dict | None, timeout, usrHeaders, sendBody: bool = True) -> dict:
+        timeout = self.timeoutTime if timeout is None else timeout
+        path = path if path.startswith("/") else "/" + path
+        url = f"{self.serverUrl}{path}"
+
+        response:Response = Response()
+
+        if contentType == "json":
+            payload = next(iter(request)) if request is not None else json.dumps({"placeholder": secrets.randbits(64)}).encode()
+            last_error = ""
+            for attempt in range(self.maxRequestRetries):
+                data, n = self.Seal(payload, method, path)
+
+                headers = {
+                    "ashtp-Session": base64.b64encode(self.sessionId).decode(), # take session id make it into base64 and turn it into words
+                    "ashtp-Counter": str(n),                                    # the counter needed for encryption/decryption
+                    "ashtp-Content": "json",                                    # content type
+                }
+
+                kwargs = {"headers": (usrHeaders or {}) | headers, "timeout": timeout}
+                if sendBody:
+                    kwargs["data"] = data
+                if usrHeaders is not None:
+                    body = kwargs.setdefault("data", {})
+                    if not isinstance(body, dict):
+                        raise TypeError("user headers can only be attached to dict bodies")
+                    uh = body.setdefault("user_headers", {})
+                    for key, header in usrHeaders.items():
+                        if isinstance(header, str):
+                            header = header.encode()
+                        uh[key] = base64.b64encode(header).decode()
+                try:
+                    resp = await asyncio.to_thread(requests.request, method, url, **kwargs)
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    self.failedRequests += 1
+                    last_error = str(e)
+                    if e.response is not None and e.response.status_code == 401:
+                        self.secureTunnelActive = False
+                    if e.response is not None and e.response.status_code < 500:
+                        raise ASHTPGeneralException(last_error) from e
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    self.failedRequests += 1
+                    last_error = str(e)
+                else:
+                    response = resp
+
+                await asyncio.sleep(
+                    min(0.25 * 2 ** attempt, 5))  # wait longer each time we fail to not hammer the server
+            raise ASHTPGeneralException(last_error)
+        elif contentType == "file":
+            payload = request
+
+        if (contentType := response.headers.get("ashtp-Content")) is not None:
+            if type == "json":
+                ...
+            elif type == "file":
+                ...
+        raise ASHTPGeneralException("welp...")
+
+
+    async def GetData(self, path:str, request:dict=None, timeout:float=None, usrHeaders:dict=None) -> dict:
+        return await self._request("GET", path, request, timeout, usrHeaders, sendBody=True)
+
+    async def PostData(self, path:str, request:dict, timeout:float=None, usrHeaders:dict=None) -> dict:
+        return await self._request("POST", path, request, timeout, usrHeaders)
+
+
+    async def GetFile(self, path:str, request:dict=None, timeout:float=None, usrHeaders:dict = None) -> Path:
+        """
+                Streams a file from the server.
+                Can only be used to request files!
+                If the file are larger than 1GB they will be put in tmp.
+
+                :param path:
+                :param usrHeaders:
+                :param timeout:
+                :param request:
+                :return: path to downlaoded file
+        """
+
         if not self.isOnline:
             raise ASHTPGeneralException("Server is offline")
         if not self.secureTunnelActive:
@@ -377,141 +487,46 @@ class ASHTPClient:
         url = f"{self.serverUrl}{path}"
         payload = request if request is not None else {"placeholder": secrets.randbits(64)}
 
-        last_error = ""
-        for attempt in range(self.maxRequestRetries):
-            data, headers, n = self.Seal(payload, method, path)
-            kwargs = {"headers": (usrHeaders or {}) | headers, "timeout": timeout}
-            if sendBody:
-                kwargs["data"] = data
+        data, headers, n = self.Seal(payload, "GET", url)
+        kwargs = {"headers": (usrHeaders or {}) | headers, "timeout": timeout}
+
+
+
+
+
+async def PostFile(self, endPoint: str, file:Path,headers:dict = {}) -> dict:
+    """
+    Posts file to the server.
+    Can only be used to upload files
+
+    :param endPoint:
+    :param file:
+    :return: response
+    """
+
+    if not self.isOnline:
+        return {"status": "failed", "code": "400", "message": "server is offline"}
+
+    if not self.isOnline:
+        return {"status": "failed", "code": "400", "message": "a secure connection to the server was not established"}
+
+    combinedUrl = f"{self.serverUrl}{endPoint if endPoint.startswith("/") else "/" + endPoint}"
+    kwargs = {"headers": self.persistentHeaders | headers}
+    last_error = ""
+
+    with open(file, "rb") as f:
+        kwargs["headers"]["Content-Name"] = f.name
+        kwargs["files"] = {"file": f}
+
+        for i in range(0, self.maxRequestRetries):
+            f.seek(0)
             try:
-                resp = await asyncio.to_thread(requests.request, method, url, **kwargs)
+                resp = await asyncio.to_thread(requests.post, combinedUrl, **kwargs)
                 resp.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                self.failedRequests += 1
-                last_error = str(e)
-                if e.response is not None and e.response.status_code == 401:
-                    self.secureTunnelActive = False
-                if e.response is not None and e.response.status_code < 500:
-                    raise ASHTPGeneralException(last_error) from e
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                self.failedRequests += 1
-                last_error = str(e)
-            else:
-                try:
-                    counter = int(resp.headers["X-Counter"])
-                except (KeyError, ValueError) as e:
-                    raise ASHTPGeneralException("bad X-Counter") from e
-                response = self.TearOpen(resp.content, method, path, counter, ref=n)
+                response = resp.json()
                 self.failedRequests = 0
                 return response
-            await asyncio.sleep(min(0.25 * 2 ** attempt, 5)) #wait longer each time we fail to not hammer the server
+            except Exception as e:
+                last_error = e
 
-        raise ASHTPGeneralException(last_error)
-
-    async def GetData(self, path, request=None, timeout=None, usrHeaders=None) -> dict:
-        return await self._request("GET", path, request, timeout, usrHeaders, sendBody=True)
-
-    async def PostData(self, path, request, timeout=None, usrHeaders=None) -> dict:
-        return await self._request("POST", path, request, timeout, usrHeaders)
-
-
-
-# async def GetFile(self, endPoint:str, request:dict=None, headers:dict = {}) -> dict:
-# raise NotImplemented
-# """
-#         Streams a file from the server.
-#         Can only be used to request files!
-#         If the file are larger than 1GB they will be put in tmp.
-#
-#         :param endPoint:
-#         :param request:
-#         :return: response
-#         """
-#
-# if not self.isOnline:
-#     return {"status": "failed", "code": "400", "message": "server is offline"}
-#
-# if not self.isOnline:
-#     return {"status": "failed", "code": "400", "message": "a secure connection to the server was not established"}
-#
-# combinedUrl = f"{self.serverUrl}{endPoint if endPoint.startswith("/") else "/" + endPoint}"
-# kwargs = {"headers": self.persistentHeaders | headers, "stream": True}
-# last_error = ""
-#
-# if request is not None:
-#     kwargs["json"] = request
-#
-# for attempt in range(0, self.maxRequestRetries):
-#     filePath = None
-#     try:
-#         resp = await asyncio.to_thread(requests.get, combinedUrl, **kwargs)
-#
-#         resp.raise_for_status()
-#
-#         total = int(resp.headers.get("Content-Length", 0))
-#         fileName = Path(resp.headers.get("Content-Name", "generic.bin")).name or "generic.bin"
-#         filePath = self._tmp / fileName
-#
-#
-#         def _download():
-#             downloaded = 0
-#             with open(filePath, "wb") as f:
-#                 for chunk in resp.iter_content(chunk_size=8192):
-#                     f.write(chunk)
-#
-#                     downloaded += len(chunk)
-#                     progress = downloaded / total * 100 if total else None
-#                     loop.call_soon_threadsafe(self.emit, "ashtp_download_progress", progress)
-#
-#
-#         loop = asyncio.get_running_loop()
-#         await asyncio.to_thread(_download)
-#
-#         self.failedRequests = 0
-#         toReturn = {"status": "success", "code": 200, "message": str(filePath)}
-#         return toReturn
-#     except Exception as e:
-#         last_error = e
-#         if filePath is not None and filePath.exists():
-#             filePath.unlink(missing_ok=True)
-#
-# return {"status": "failed", "code": "000", "message": str(last_error)}
-
-# TODO implement this bs pls
-# async def PostFile(self, endPoint: str, file:Path,headers:dict = {}) -> dict:
-# raise NotImplemented
-# """
-# Posts file to the server.
-# Can only be used to upload files
-#
-# :param endPoint:
-# :param file:
-# :return: response
-# """
-#
-# if not self.isOnline:
-#     return {"status": "failed", "code": "400", "message": "server is offline"}
-#
-# if not self.isOnline:
-#     return {"status": "failed", "code": "400", "message": "a secure connection to the server was not established"}
-#
-# combinedUrl = f"{self.serverUrl}{endPoint if endPoint.startswith("/") else "/" + endPoint}"
-# kwargs = {"headers": self.persistentHeaders | headers}
-# last_error = ""
-#
-# with open(file, "rb") as f:
-#     kwargs["headers"]["Content-Name"] = f.name
-#     kwargs["files"] = {"file": f}
-#
-#     for i in range(0, self.maxRequestRetries):
-#         f.seek(0)
-#         try:
-#             resp = await asyncio.to_thread(requests.post, combinedUrl, **kwargs)
-#             resp.raise_for_status()
-#             response = resp.json()
-#             self.failedRequests = 0
-#             return response
-#         except Exception as e:
-#             last_error = e
-#
-# return {"status": "failed", "code": "000", "message": str(last_error)}  # TOD
+    return {"status": "failed", "code": "000", "message": str(last_error)}

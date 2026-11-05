@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "artys-std"
+version = "0.0.2"
+description = "Arty's standard library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Artytuihj" }]
+keywords = ["stdlib"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+net = ["requests>=2.31", "cryptography>=42"]
+all = ["artys-std[net]"]
+
+[project.urls]
+Homepage = "https://github.com/you/artys-std"
+Issues = "https://github.com/you/artys-std/issues"
