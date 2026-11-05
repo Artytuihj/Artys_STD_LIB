@@ -1,6 +1,6 @@
 # Arty's STD LIB
 
-A collection of commonly used modules shared across all of Arty's projects.
+A collection of commonly used modules shared across all of Arty's (my) projects.
 
 ## Modules
 
