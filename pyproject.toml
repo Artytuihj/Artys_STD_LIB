@@ -3,7 +3,7 @@ requires = ["hatchling >= 1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "artys-std"
+name = "artysstd"
 version = "0.0.2"
 authors = [{ name = "Artytuihj" }]
 description = "Arty's standard library"
