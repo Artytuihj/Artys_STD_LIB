@@ -1,26 +1,39 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling >= 1.26"]
 build-backend = "hatchling.build"
 
 [project]
 name = "artys-std"
 version = "0.0.2"
-description = "Arty's standard library"
-readme = "README.md"
-requires-python = ">=3.10"
-license = "MIT"
 authors = [{ name = "Artytuihj" }]
+description = "Arty's standard library"
+
+requires-python = ">=3.10"
 keywords = ["stdlib"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+readme = "README.md"
+
 dependencies = []
 
 [project.optional-dependencies]
-net = ["requests>=2.31", "cryptography>=42"]
-all = ["artys-std[net]"]
+clientnet = ["requests>=2.31", "cryptography>=42"]
+servernet = ["artys-std[net]", "fastapi>=0.110"]
+all = ["artys-std[servernet]"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["/src/artystd"]
 
 [project.urls]
-Homepage = "https://github.com/you/artys-std"
-Issues = "https://github.com/you/artys-std/issues"
+Homepage = "https://github.com/Artytuihj/Artys_STD_LIB"
+Issues = "https://github.com/Artytuihj/Artys_STD_LIB/issues/"

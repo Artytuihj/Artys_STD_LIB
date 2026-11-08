@@ -25,6 +25,7 @@ from requests import Response
 from src.artystd.ashtp import PROTOCOL_VERSION
 from src.artystd.utilities.ArtysEventManager import ArtysEventManager
 
+
 class HandshakeError(Exception):
     pass
 
