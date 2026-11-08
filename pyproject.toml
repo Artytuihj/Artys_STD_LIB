@@ -23,7 +23,7 @@ dependencies = []
 
 [project.optional-dependencies]
 clientnet = ["requests>=2.31", "cryptography>=42"]
-servernet = ["artys-std[net]", "fastapi>=0.110"]
+servernet = ["artys-std[clientnet]", "fastapi>=0.110"]
 all = ["artys-std[servernet]"]
 
 [tool.hatch.build.targets.sdist]
