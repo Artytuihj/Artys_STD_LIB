@@ -489,6 +489,7 @@ class ASHTPClient:
                 return unwrapped, dict(response.headers) | unwrapped.get("headers", {})
             elif respContentType == "file":
                 ...#TODO implement what happens in case we recive a file back ok :)
+                   # procrastinating for like 5 days now...
         raise ASHTPGeneralException("welp...")
 
     async def GetData(self, path:str, request:dict=None, timeout:float=None, usrHeaders:dict=None) -> dict:
