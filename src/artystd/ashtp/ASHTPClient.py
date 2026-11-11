@@ -1,23 +1,17 @@
 #std
 import json
 import secrets
-import tempfile
 import time
 import zipfile
-from email import generator
 from pathlib import Path
 import asyncio
 import logging
 import base64
 import hashlib
-from typing import Iterable, Iterator
-import struct
 
 #pypi
 import requests
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.exceptions import InvalidTag
 from requests import Response
@@ -25,56 +19,9 @@ from requests import Response
 #in module
 from src.artystd.ashtp import PROTOCOL_VERSION
 from src.artystd.utilities.ArtysEventManager import ArtysEventManager
-
-
-class HandshakeError(Exception):
-    pass
-
-class ParsingError(Exception):
-    pass
-
-class ReplayError(Exception):
-    pass
-
-class ASHTPGeneralException(Exception):
-    pass
-
-
-def _DeriveKeys(secret:bytes, transcrypt:bytes, length:int=64)-> tuple[bytes,bytes]:
-    symKey = HKDF(algorithm=hashes.SHA256(), length=length, salt=None,
-                  info=b"ashtp sym sesscion key" + transcrypt).derive(secret)
-    return symKey[32:], symKey[:32]
-
-def _aad(sid: bytes, method: str, endpoint: str, ref: int | None = None) -> bytes:
-    if not endpoint.startswith("/"):
-        endpoint = "/" + endpoint
-    a = sid + method.upper().encode() + b" " + endpoint.encode()
-    if ref is not None:
-        a += b" " + ref.to_bytes(8, "little")   # fixed width at the end, so unambiguous
-    return a
-
-class Session():
-    def __init__(self, send_key:bytes, recv_key:bytes):
-        self.send = ChaCha20Poly1305(send_key)
-        self.recv = ChaCha20Poly1305(recv_key)
-        self.sendN = 0
-        self.recvN = -1
-
-    @staticmethod
-    def _nonce(n: int) -> bytes:
-        return b"\0" * 4 + n.to_bytes(8, "little") # generates a 12 byte number ( 0 0 0 0 )just filed with zeros (0 0 0 0 0 0 0 0) a simple counter little means less significant comes first
-
-    def Encrypt(self, data:bytes, tag:bytes = b""):
-        n = self.sendN # save the number used to build the nonce
-        self.sendN += 1 # increment
-        return n, self.send.encrypt(self._nonce(n), data, tag) # here we encrypt data with the send key and tag (ct stands for "cyphertext")
-
-    def Decrypt(self, data:bytes,n ,tag:bytes = b""):
-        if not ( self.recvN < n < 2**64): # make sure we are not being replayed and below the limit
-            raise ReplayError("The message is being replayed or key is stale. rekey! ")
-        dr = self.recv.decrypt(self._nonce(n), data, tag) # do the same as encrypt but backwards ("dr" stands for decryption result)
-        self.recvN = n
-        return dr
+from .Session import Session
+from .ASHTPExceptions import HandshakeError, ParsingError, ASHTPGeneralException
+from .ASHTPBase import ASHTPBase
 
 class ASHTPClient:
     def __init__(self,
@@ -112,9 +59,6 @@ class ASHTPClient:
         # ---------- health polling settings ----------
         self.healthCheckRate: int = health_poll_rate
 
-        # ---------- file transfer ----------
-        self._tmp = Path(tempfile.gettempdir()) / "ashtp" / "C"
-        self._tmp.mkdir(parents=True, exist_ok=True)
 
         # ---------- integrations (optional) ----------
         self.logger = logging.getLogger(__name__)
@@ -140,7 +84,7 @@ class ASHTPClient:
         self.isOnline: bool = False
         self.failedRequests: int = 0
 
-        # ---------- background tasks (keep last, they use everything above) ----------
+        # ---------- background tasks ----------
         self._healthTask = None
 
     def Log(self, message:str):
@@ -152,125 +96,6 @@ class ASHTPClient:
     def emit(self, event:str ,*args, **kwargs):
         ArtysEventManager.EmitEvent(event, *args, **kwargs)
 
-
-    def Parse(self, msg: dict, fmt: dict)-> dict:
-        """
-        takes one dict and compares it to a template
-        :param msg:
-        :param fmt:
-        :return:
-        """
-        if not isinstance(msg, dict) or set(msg) - set(fmt):
-            raise ParsingError("msg inst a dict or has forbidden fields")
-        output = {}
-
-        for name , spec in fmt.items():
-            if name not in msg:
-                if spec["required"]:
-                    raise ParsingError("msg is missing keys defined in template")
-                continue
-            value = msg[name]
-            if spec["type"] is bytes:
-                try:
-                    value = base64.b64decode(value, validate=True)
-                except Exception as e:
-                    raise ParsingError(f"{name} isn't bytes or the field is corrupted")
-
-                if len(value) != spec["len"]:
-                    raise ParsingError(f"{name} dosen't match length target")
-            elif not isinstance(value, spec["type"]):
-                raise ParsingError(f"{name} dosen't match type")
-            output[name] = value
-        return output
-
-    def Seal(self, msg:bytes, method:str, path:str,session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> tuple[bytes, int]:
-        """ Turns unencrypted JSON into request ready data
-
-        :param ref:
-        :param sessionId:
-        :param session:
-        :param msg:
-        :param method:
-        :param path:
-        :return:
-        """
-
-        sec = session if session is not None else self.session
-        secId = sessionId if sessionId is not None else self.sessionId
-
-        plain = json.dumps(msg).encode()
-        tag = _aad(secId, method, path, ref=ref)
-        n, data = sec.Encrypt(plain, tag)
-
-        return data, n
-
-    def SealFileStream(self, meta:dict, filePath:Path, method:str, path:str, chunkSize:int=65*1024,
-                       session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> Iterator[tuple[bytes, int]]:
-        """ Turns an unencrypted File into request ready byte stream
-
-        :param chunkSize:
-        :param filePath:
-        :param meta:
-        :param method:
-        :param path:
-        :param sessionId:
-        :param session:
-        :param ref:
-        :return:
-        """
-
-        sec = session if session is not None else self.session
-        secId = sessionId if sessionId is not None else self.sessionId
-        initialRequest = json.dumps( meta | {"chunk_size": chunkSize} ).encode()
-        with tempfile.TemporaryDirectory(dir=self._tmp) as td: # niche thing i like
-
-            zipPath = Path(td) / f"{filePath.name}.zip"
-            with zipfile.ZipFile(zipPath, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file in filePath.rglob("*"):
-                    if file.is_dir():
-                        zf.write(file, arcname=str(file.relative_to(filePath)) + "/")
-                    else:
-                        zf.write(file, arcname=file.relative_to(filePath))
-
-            data, n = self.Seal(initialRequest, method, path, sec, secId, ref)
-            yield data, n
-
-            with zipPath.open("rb") as f:
-                while chunk := f.read(chunkSize):
-                    data, n = self.Seal(chunk, method, path, sec, secId, ref)
-                    yield data, n
-
-
-
-    def frame(self, gen, counter):
-        for chunk in gen:
-            yield struct.pack(">QI", counter, len(chunk)) + chunk
-
-    def TearOpen(self, msg:bytes, method:str, path:str, serverCount:int, session:Session|None = None, sessionId:bytes|None = None, ref:int|None = None) -> dict:
-        """
-        Turns encrypt byte data into (hopefuly) a readable JSON
-
-        :param ref:
-        :param serverCount:
-        :param msg:
-        :param method:
-        :param path:
-        :param session:
-        :param sessionId:
-        :return:
-        """
-        sec = session if session is not None else self.session
-        secId = sessionId if sessionId is not None else self.sessionId
-
-        if sec is None or secId is None:
-            raise HandshakeError("no active session")
-
-        path = path if path.startswith("/") else "/" + path
-        n = serverCount
-        tag = _aad(secId, method, path, ref=ref)
-        plain  = sec.Decrypt(msg, n, tag)
-
-        return json.loads(plain.decode())
 
     async def Init(self,api_key:str) -> bool:
         """
@@ -312,11 +137,11 @@ class ASHTPClient:
                 continue
 
             try:
-                reply = self.Parse(resp.json(), self.HELLO_REPLY_FORMAT)# check that the handshake package is actualy valid
+                reply = ASHTPBase.Parse(resp.json(), self.HELLO_REPLY_FORMAT)# check that the handshake package is actualy valid
                 F = reply["F"]
                 eF = e.exchange(X25519PublicKey.from_public_bytes(F)) # exchange keys to get the secret number (mix our private with servers public)
 
-                c2s, s2c = _DeriveKeys(eS + eF, proto + key_id + Eb + F + self.Sb + reply["session_id"])
+                c2s, s2c = ASHTPBase.DeriveKeys(eS + eF, proto + key_id + Eb + F + self.Sb + reply["session_id"])
                 session = Session(c2s, s2c)
 
                 if session.Decrypt(reply["ok"],0, b"") != b"lets go":
@@ -328,7 +153,7 @@ class ASHTPClient:
             try:
                 authPackage = json.dumps({ "api_key":api_key }).encode()
 
-                authBytes, n = self.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
+                authBytes, n = ASHTPBase.Seal(authPackage, "POST", self.serverAuthEndpoint, session, reply["session_id"])
                 headers = {
                     "ashtp-Session": base64.b64encode(reply["session_id"]).decode(),    # take session id make it into base64 and turn it into words
                     "ashtp-Counter": str(n),                                            # the counter needed for encryption/decryption
@@ -338,9 +163,9 @@ class ASHTPClient:
                                                data=authBytes, headers=headers, timeout=self.timeoutTime)
                 resp.raise_for_status()
                 serverCounter= int(resp.headers["ashtp-Counter"])
-                resp = self.TearOpen(resp.content, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"], ref=n)
+                resp = ASHTPBase.TearOpen(resp.content, "POST", self.serverAuthEndpoint, serverCounter ,session, reply["session_id"], ref=n)
 
-                resp = self.Parse(resp, self.AUTH_REPLY_FORMAT)
+                resp = ASHTPBase.Parse(resp, self.AUTH_REPLY_FORMAT)
                 if not resp.get("ok") == "ok": raise HandshakeError("couldnt log in")
 
             except Exception as err:
@@ -364,9 +189,9 @@ class ASHTPClient:
 
         while True:
             try:
-                resp = await asyncio.to_thread(requests.get, combinedUrl,timeout=self.timeoutTime)
+                resp:Response = await asyncio.to_thread(requests.get, combinedUrl,timeout=self.timeoutTime)
                 resp.raise_for_status()
-                if resp.json():
+                if resp.ok:
                     self.failedRequests = 0
                 else:
                     self.failedRequests += 1
@@ -415,7 +240,7 @@ class ASHTPClient:
             payload = request if request is not None else json.dumps({"placeholder": secrets.randbits(64)}).encode()
             last_error = ""
             for attempt in range(self.maxRequestRetries):
-                data, n = self.Seal(payload, method, path)
+                data, n = ASHTPBase.Seal(payload, method, path, self.session, self.sessionId)
 
                 headers = {
                     "ashtp-Session": base64.b64encode(self.sessionId).decode(), # take session id make it into base64 and turn it into words
@@ -464,7 +289,7 @@ class ASHTPClient:
 
             if not request["file"]: raise FileNotFoundError("File path expected by got NONE")
             kwargs = {"headers": (usrHeaders or {}) | headers, "timeout": timeout,
-                      "data": self.frame(self.SealFileStream(usrHeaders, Path(request.decode()), method, path))}
+                      "data": ASHTPBase.Frame(ASHTPBase.SealFileStream(usrHeaders, Path(request.decode()), method, path, self.session, self.sessionId))}#TODO headers are mad fix them
             try:
                 resp = await asyncio.to_thread(requests.request, method, url, **kwargs)
                 resp.raise_for_status()
@@ -484,12 +309,13 @@ class ASHTPClient:
 
         if (respContentType := response.headers.get("ashtp-Content")) is not None:
             if respContentType == "json":
-                unwrapped = self.TearOpen(response.content, method, path, int(response.headers["ashtp-Counter"]))
+                unwrapped = ASHTPBase.TearOpen(response.content, method, path, int(response.headers["ashtp-Counter"]), self.session, self.sessionId)
                 unwrapped["status-code"] = response.status_code
                 return unwrapped, dict(response.headers) | unwrapped.get("headers", {})
             elif respContentType == "file":
                 ...#TODO implement what happens in case we recive a file back ok :)
                    # procrastinating for like 5 days now...
+                   # ts is still not done wtf
         raise ASHTPGeneralException("welp...")
 
     async def GetData(self, path:str, request:dict=None, timeout:float=None, usrHeaders:dict=None) -> dict:
@@ -503,6 +329,7 @@ class ASHTPClient:
 
 
 async def PostFile(self, endPoint: str, file:Path,headers:dict = {}) -> dict:
+    raise Exception("why tf u shouldnt be here")
     """
     Posts file to the server.
     Can only be used to upload files
