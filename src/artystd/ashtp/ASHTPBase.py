@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from requests import Request
 
-from artystd.ashtp import TMP
+from artystd.ashtp import TMP, ContentType
 from artystd.ashtp.ASHTPExceptions import BodyTooLarge, HandshakeError, ParsingError
 from artystd.ashtp.Session import Session
 
@@ -18,6 +18,13 @@ from artystd.ashtp.Session import Session
 class ASHTPBase:
     @classmethod
     async def ReadBody(cls, req: Request, limit: int) -> tuple[bytes, dict]:
+        """
+        Take a Request item and unpack it into usable data#TODO finish this function
+
+        :param req:
+        :param limit:
+        :return:
+        """
         cl = req.headers.get("content-length")
         if cl is not None and int(cl) > limit:
             raise BodyTooLarge
@@ -26,16 +33,33 @@ class ASHTPBase:
             buf += chunk
             if len(buf) > limit:
                 raise BodyTooLarge
-        return bytes(buf), dict(req.headers)
+        return bytes(buf), dict(req.headers)#TODO add support for multiple output types
 
     @classmethod
-    def DeriveKeys(cls,secret: bytes, transcrypt: bytes, length: int = 64) -> tuple[bytes, bytes]:
+    def DeriveKeys(cls, secret: bytes, transcrypt: bytes, length: int = 64) -> tuple[bytes, bytes]:
+        """
+        Derives keys... there isnt much else to say :|
+
+        :param secret:
+        :param transcrypt:
+        :param length:
+        :return:
+        """
         symKey = HKDF(algorithm=hashes.SHA256(), length=length, salt=None,
                       info=b"ashtp sym sesscion key" + transcrypt).derive(secret)
         return symKey[32:], symKey[:32]
 
     @classmethod
     def Aad(cls, sid:bytes, method:str, endpoint:str, ref:int|None = None) -> bytes:
+        """
+        Generates the encryption tag/aad
+
+        :param sid:
+        :param method:
+        :param endpoint:
+        :param ref:
+        :return:
+        """
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
         a = sid + method.upper().encode() + b" " + endpoint.encode()
@@ -91,7 +115,8 @@ class ASHTPBase:
     @classmethod
     def Parse(cls, msg: dict, fmt: dict)-> dict:
         """
-        takes one dict and compares it to a template
+        takes a dict and compares it to a template
+
         :param msg:
         :param fmt:
         :return:
@@ -112,7 +137,7 @@ class ASHTPBase:
                 except Exception as e:
                     raise ParsingError(f"{name} isn't bytes or the field is corrupted")
 
-                if len(value) != spec["len"]:
+                if len(value) != spec["len"]:#todo add suppoort for the size header
                     raise ParsingError(f"{name} dosen't match length target")
             elif not isinstance(value, spec["type"]):
                 raise ParsingError(f"{name} dosen't match type")
@@ -121,6 +146,13 @@ class ASHTPBase:
 
     @classmethod
     def Frame(cls, gen, counter):
+        """
+        adds a frame around every chunk with its metadata
+
+        :param gen:
+        :param counter:
+        :return:
+        """
         for chunk in gen:
             yield struct.pack(">QI", counter, len(chunk)) + chunk
 
@@ -140,7 +172,7 @@ class ASHTPBase:
         :return:
         """
 
-        initialRequest = json.dumps( meta | {"chunk_size": chunkSize} ).encode()
+        initialRequest = json.dumps( meta | {"chunk_size": chunkSize} ).encode()#todo add support for the new headers
         with tempfile.TemporaryDirectory(dir=TMP) as td: # niche thing i like
 
             zipPath = Path(td) / f"{filePath.name}.zip"
@@ -158,3 +190,25 @@ class ASHTPBase:
                 while chunk := f.read(chunkSize):
                     data, n = cls.Seal(chunk, method, path, session, sessionId, ref)
                     yield data, n
+
+    @classmethod
+    def StandardHeaders(cls,contentType:ContentType, sessionId:bytes, counter:int, sendUHeaders:bool, size:int, chunkSize:None|int = None):
+        """
+        Returns the default Header table that should be attached to every ashtp request
+
+        :param contentType:
+        :param sessionId:
+        :param counter:
+        :param sendUHeaders:
+        :param size:
+        :param chunkSize:
+        :return:
+        """
+        return {
+            "ashtp-session": base64.b64encode(sessionId).decode(),
+            "ashtp-counter": str(counter),
+            "ashtp-content_type": str(contentType),
+            "ashtp-inc_uheaders": sendUHeaders,
+            "ashtp-size":str(size),
+            "ashtp-chunk_size": str(chunkSize) if chunkSize else -1
+        }
