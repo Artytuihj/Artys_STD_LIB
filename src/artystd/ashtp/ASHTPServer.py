@@ -226,7 +226,7 @@ class ASHTPServer:
                 "ok":         base64.b64encode( ct ).decode()
             }
             return reply
-        except BodyTooLarge as e:
+        except BodyTooLarge as e: # tell him to fuck off ye!
             return Response(status_code=413) #body to large
         except (ValueError, ParsingError, HandshakeError) as e:
             self.Error(str(e))
