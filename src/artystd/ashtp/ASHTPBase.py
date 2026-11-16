@@ -1,39 +1,65 @@
 import base64
 import json
+import random
 import struct
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterator
+from zipfile import ZIP_FILECOUNT_LIMIT
 
+from charset_normalizer import from_path
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from requests import Request
+from requests import Response
+from fastapi import Request
 
-from artystd.ashtp import TMP, ContentType
+from artystd.ashtp import TMP, chunkSizeLimit, fileSizeLimit
+from artystd.ashtp.ASHTPEnums import ContentType, BaseHeaders
 from artystd.ashtp.ASHTPExceptions import BodyTooLarge, HandshakeError, ParsingError
 from artystd.ashtp.Session import Session
 
 
 class ASHTPBase:
     @classmethod
-    async def ReadBody(cls, req: Request, limit: int) -> tuple[bytes, dict]:
+    async def ReadBody(cls, req: Request | Response):
         """
-        Take a Request item and unpack it into usable data#TODO finish this function
+        Takes a Request item and unpacks + decrypts it into usable data
 
         :param req:
-        :param limit:
         :return:
         """
-        cl = req.headers.get("content-length")
-        if cl is not None and int(cl) > limit:
-            raise BodyTooLarge
-        buf = bytearray()
-        async for chunk in req.stream():
-            buf += chunk
-            if len(buf) > limit:
-                raise BodyTooLarge
-        return bytes(buf), dict(req.headers)#TODO add support for multiple output types
+
+        contentSize = req.headers.get(BaseHeaders.SESSION)
+        contentType = req.headers.get(BaseHeaders.CONTENT_TYPE)
+
+        reqType = "req" if isinstance(req, Request) else "resp"
+
+        try:
+            contentType = ContentType(str(contentType))
+        except ValueError:
+            raise ParsingError("Received an unexpected header value")
+
+        if contentType.isStream:
+            # ============STREAM=============
+            total = 0
+            tmpFileName = random.randbytes(20).hex()
+
+            chunkSize = req.headers.get(BaseHeaders.CHUNK_SIZE)
+            if chunkSize > chunkSizeLimit or contentSize > fileSizeLimit:
+                raise BodyTooLarge("File or Chunk exceeded the limit")
+
+            with tempfile.TemporaryDirectory(dir=TMP) as td:
+                pathToTmpFile = Path(td) / tmpFileName
+                with open(pathToTmpFile, "wb") as f:
+                    #TODO continue working on this yo uneed to add two separate data reads based on what library we are using
+
+
+        else:
+            # ============SINGLE=============
+            ...
+
+
 
     @classmethod
     def DeriveKeys(cls, secret: bytes, transcrypt: bytes, length: int = 64) -> tuple[bytes, bytes]:
@@ -204,11 +230,11 @@ class ASHTPBase:
         :param chunkSize:
         :return:
         """
-        return {
-            "ashtp-session": base64.b64encode(sessionId).decode(),
-            "ashtp-counter": str(counter),
-            "ashtp-content_type": str(contentType),
-            "ashtp-inc_uheaders": sendUHeaders,
-            "ashtp-size":str(size),
-            "ashtp-chunk_size": str(chunkSize) if chunkSize else -1
+        return{
+            f"{BaseHeaders.SESSION}": base64.b64encode(sessionId).decode(),
+            f"{BaseHeaders.COUNTER}": str(counter),
+            f"{BaseHeaders.CONTENT_TYPE}": str(contentType),
+            f"{BaseHeaders.INCL_HEADERS}": sendUHeaders,
+            f"{BaseHeaders.SIZE}":str(size),
+            f"{BaseHeaders.CHUNK_SIZE}": str(chunkSize) if chunkSize else -1
         }

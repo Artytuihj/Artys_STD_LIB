@@ -17,7 +17,7 @@ from cryptography.exceptions import InvalidTag
 from requests import Response
 
 #in module
-from src.artystd.ashtp import PROTOCOL_VERSION
+from src.artystd.ashtp import PROTOCOL_VERSION, idr
 from src.artystd.utilities.ArtysEventManager import ArtysEventManager
 from .Session import Session
 from .ASHTPExceptions import HandshakeError, ParsingError, ASHTPGeneralException
@@ -39,7 +39,8 @@ class ASHTPClient:
         # ----------------------------------------------
         # |||  Arty's Secure HTTP Transport Protocol |||
         # ----------------------------------------------
-
+        if idr != "yes":
+            raise Exception("no")
         # ---------- protocol ----------
         self._version: str = PROTOCOL_VERSION
 

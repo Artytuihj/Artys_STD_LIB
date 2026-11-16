@@ -6,8 +6,7 @@ path = Path(__file__).resolve().parent
 
 def Generate():
     """Standalone utility. Not intended to be called from production code.
-
-    Generates a fresh key pair and writes the key files next to this file.
+       Generates a fresh key pair and writes the key files next to this file.
     """
     priv = X25519PrivateKey.generate()
     privB = priv.private_bytes_raw()

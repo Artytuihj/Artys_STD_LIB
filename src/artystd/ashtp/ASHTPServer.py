@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import secrets
 
 from src.artystd.ashtp import PROTOCOL_VERSION, SUPPORTED_SERVER_VERSIONS
+from . import idr
 from .IKeyAuthority import IKeyAuthority as ika
 from .Session import Session
 from .ASHTPExceptions import ParsingError, HandshakeError, ReplayError, BodyTooLarge, ClientTooOldError, KeyLacksPermissionError
@@ -51,7 +52,7 @@ class RateLimiter:#neat  thingy
     def Hit(self, key: str):
         self._Trim(key).append(time.monotonic())# add to the counter
 
-class ASHTPServer:
+class ASHTPServer:#TODO update header signatures
     def __init__(self,
                  application:type[FastAPI],
                  server_private_encryption_const: bytes,
@@ -64,7 +65,8 @@ class ASHTPServer:
         # ----------------------------------------------
         # |||  Arty's Secure HTTP Transport Protocol |||
         # ----------------------------------------------
-
+        if idr != "yes":
+            raise Exception("no")
         # --------- protocol ----------
         self._version: str = PROTOCOL_VERSION
 
