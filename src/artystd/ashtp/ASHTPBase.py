@@ -15,7 +15,7 @@ from pydantic.v1 import JsonError
 from requests import Response
 from fastapi import Request
 
-from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT
+from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT, JSON_PACKAGE_SIZE_LIMIT, FILE_PACKAGE_SIZE_LIMIT
 from artystd.ashtp.ASHTPEnums import ContentType, BaseHeaders
 from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, MalformedHeader
 from artystd.ashtp.Session import Session
@@ -37,6 +37,8 @@ class ASHTPBase:
         chunkSize = req.headers.get(BaseHeaders.CHUNK_SIZE)
         counter = req.headers.get(BaseHeaders.COUNTER)
 
+        tmpFileName = random.randbytes(20).hex()
+
         reqType = "req" if isinstance(req, Request) else "resp"
 
         try:
@@ -49,7 +51,6 @@ class ASHTPBase:
 
         if contentType.isStream:
             # ============STREAM=============
-            tmpFileName = random.randbytes(20).hex()
             total = 0
 
             def _CheckSize(chk: bytes, ttl) -> int:
@@ -79,7 +80,7 @@ class ASHTPBase:
                             f.write(chunk)
                     else:
                         raise ParsingError("Fym u ran out of options... HOW!?")
-                #TODO unzip and return
+                #TODO unzip and return [1]
         else:
             data: bytes
             if reqType == "req":
@@ -88,15 +89,30 @@ class ASHTPBase:
                 data = req.content
 
             if contentType == ContentType.JSON:
+                if len(data) > JSON_PACKAGE_SIZE_LIMIT:
+                    raise ContentTooLarge("Json size exceeded the limit")
+
                 plain = cls.TearOpen(data, req.method, str(req.url), counter, session, sessionId)
                 try:
                     notSoPlain = json.loads(plain)
                 except JsonError:
                     raise ParsingError("Couldnt parse bytes into json ")
 
-                if notSoPlain.get("")
+                return notSoPlain
             elif contentType == ContentType.SMALL_FILE:
-                ...
+                if len(data) > FILE_PACKAGE_SIZE_LIMIT:
+                    raise ContentTooLarge("Small File size exceeded the limit")
+
+                plain = cls.TearOpen(data, req.method, str(req.url), counter, session, sessionId)
+
+                with tempfile.TemporaryDirectory(dir=TMP) as td:
+                    pathToTmpFile = Path(td) / tmpFileName
+                    with open(pathToTmpFile, "wb") as f:
+                        f.write(plain)
+
+                        #TODO add file unzip and retutn reutns
+                        #for here and [1] add a _helper method
+
             else:
                 raise ParsingError("Tried Using non existant content type lmao")
 
