@@ -11,12 +11,13 @@ from zipfile import ZIP_FILECOUNT_LIMIT
 from charset_normalizer import from_path
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from pydantic.v1 import JsonError
 from requests import Response
 from fastapi import Request
 
 from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT
 from artystd.ashtp.ASHTPEnums import ContentType, BaseHeaders
-from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, UnpackError, MalformedHeader
+from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, MalformedHeader
 from artystd.ashtp.Session import Session
 
 _HDR = struct.Struct(">QI") # the header template
@@ -34,6 +35,7 @@ class ASHTPBase:
         contentSize = req.headers.get(BaseHeaders.SIZE)
         contentType = req.headers.get(BaseHeaders.CONTENT_TYPE)
         chunkSize = req.headers.get(BaseHeaders.CHUNK_SIZE)
+        counter = req.headers.get(BaseHeaders.COUNTER)
 
         reqType = "req" if isinstance(req, Request) else "resp"
 
@@ -41,6 +43,7 @@ class ASHTPBase:
             contentSize = int(contentSize)
             contentType = ContentType(str(contentType))
             chunkSize = int(chunkSize)
+            counter = int(counter)
         except ValueError:
             raise ParsingError("Received an unexpected header value")
 
@@ -76,9 +79,22 @@ class ASHTPBase:
                             f.write(chunk)
                     else:
                         raise ParsingError("Fym u ran out of options... HOW!?")
+                #TODO unzip and return
         else:
+            data: bytes
+            if reqType == "req":
+                data = await req.body()
+            elif reqType == "resp":
+                data = req.content
+
             if contentType == ContentType.JSON:
-                ...
+                plain = cls.TearOpen(data, req.method, str(req.url), counter, session, sessionId)
+                try:
+                    notSoPlain = json.loads(plain)
+                except JsonError:
+                    raise ParsingError("Couldnt parse bytes into json ")
+
+                if notSoPlain.get("")
             elif contentType == ContentType.SMALL_FILE:
                 ...
             else:
@@ -147,7 +163,7 @@ class ASHTPBase:
     @classmethod
     def Seal(cls, msg:bytes, method:str, path:str,session:Session, sessionId:bytes, ref:int|None = None) -> tuple[bytes, int]:
         """ Turns unencrypted JSON into request ready data
-
+        #TODO go around and make sure that every thing seals with a FULL URL
         :param ref:
         :param sessionId:
         :param session:

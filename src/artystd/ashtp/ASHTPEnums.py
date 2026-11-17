@@ -7,7 +7,7 @@ class ContentType(StrEnum):
 
     @property
     def isStream(self) -> bool:
-        return self in (ContentType.BYTE_STREAM, ContentType.FILE_STREAM)
+        return self in (ContentType.FILE_STREAM)
 
 
 class BaseHeaders(StrEnum):
