@@ -5,7 +5,7 @@ class ParsingError(Exception):
     pass
 class ReplayError(Exception):
     pass
-class BodyTooLarge(Exception):
+class ContentTooLarge(Exception):
     pass
 class ErrorHandlingError(Exception): #tf
     pass
@@ -14,4 +14,6 @@ class ClientTooOldError(Exception):
 class KeyLacksPermissionError(Exception):
     pass
 class ASHTPGeneralException(Exception):
+    pass
+class MalformedHeader(Exception):
     pass

@@ -20,7 +20,7 @@ from src.artystd.ashtp import PROTOCOL_VERSION, SUPPORTED_SERVER_VERSIONS
 from . import idr
 from .IKeyAuthority import IKeyAuthority as ika
 from .Session import Session
-from .ASHTPExceptions import ParsingError, HandshakeError, ReplayError, BodyTooLarge, ClientTooOldError, KeyLacksPermissionError
+from .ASHTPExceptions import ParsingError, HandshakeError, ReplayError, ContentTooLarge, ClientTooOldError, KeyLacksPermissionError
 from .ASHTPBase import ASHTPBase
 
 @dataclass
@@ -147,7 +147,7 @@ class ASHTPServer:#TODO update header signatures
                 except (KeyError, ValueError, ReplayError, InvalidTag) as e:
                     self.Error(f"{path}: {e}")
                     return Response(status_code=400) # broken request
-                except BodyTooLarge:
+                except ContentTooLarge:
                     return Response(status_code=413) # body too large
 
                 # handle request
@@ -228,7 +228,7 @@ class ASHTPServer:#TODO update header signatures
                 "ok":         base64.b64encode( ct ).decode()
             }
             return reply
-        except BodyTooLarge as e: # tell him to fuck off ye!
+        except ContentTooLarge as e: # tell him to fuck off ye!
             return Response(status_code=413) #body to large
         except (ValueError, ParsingError, HandshakeError) as e:
             self.Error(str(e))
@@ -265,7 +265,7 @@ class ASHTPServer:#TODO update header signatures
                 raise KeyLacksPermissionError("Key dosen't have enough permissions or dosen't match")
 
 
-        except BodyTooLarge:
+        except ContentTooLarge:
             return Response(status_code=413) # too large bish
         except (KeyError, ValueError, ParsingError, HandshakeError, ReplayError, InvalidTag) as e:
             self.Error(str(e))

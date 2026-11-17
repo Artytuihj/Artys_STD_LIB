@@ -14,15 +14,16 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from requests import Response
 from fastapi import Request
 
-from artystd.ashtp import TMP, chunkSizeLimit, fileSizeLimit
+from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT
 from artystd.ashtp.ASHTPEnums import ContentType, BaseHeaders
-from artystd.ashtp.ASHTPExceptions import BodyTooLarge, HandshakeError, ParsingError
+from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, UnpackError, MalformedHeader
 from artystd.ashtp.Session import Session
 
+_HDR = struct.Struct(">QI") # the header template
 
 class ASHTPBase:
     @classmethod
-    async def ReadBody(cls, req: Request | Response):
+    async def ReadBody(cls, req: Request | Response, session:Session, sessionId:bytes):
         """
         Takes a Request item and unpacks + decrypts it into usable data
 
@@ -30,34 +31,59 @@ class ASHTPBase:
         :return:
         """
 
-        contentSize = req.headers.get(BaseHeaders.SESSION)
+        contentSize = req.headers.get(BaseHeaders.SIZE)
         contentType = req.headers.get(BaseHeaders.CONTENT_TYPE)
+        chunkSize = req.headers.get(BaseHeaders.CHUNK_SIZE)
 
         reqType = "req" if isinstance(req, Request) else "resp"
 
         try:
+            contentSize = int(contentSize)
             contentType = ContentType(str(contentType))
+            chunkSize = int(chunkSize)
         except ValueError:
             raise ParsingError("Received an unexpected header value")
 
         if contentType.isStream:
             # ============STREAM=============
-            total = 0
             tmpFileName = random.randbytes(20).hex()
+            total = 0
 
-            chunkSize = req.headers.get(BaseHeaders.CHUNK_SIZE)
-            if chunkSize > chunkSizeLimit or contentSize > fileSizeLimit:
-                raise BodyTooLarge("File or Chunk exceeded the limit")
+            def _CheckSize(chk: bytes, ttl) -> int:
+                if len(chk) > CHUNK_SIZE_LIMIT:
+                    raise ContentTooLarge("Received chunk size exceeded the limit")
+                ttl += len(chk)
+                if ttl > FILE_SIZE_LIMIT:
+                    raise ContentTooLarge("File size exceeded the limit")
+                return ttl
+
+            if chunkSize > CHUNK_SIZE_LIMIT or contentSize > FILE_SIZE_LIMIT:
+                raise ContentTooLarge("File or Chunk size exceeded the limit")
 
             with tempfile.TemporaryDirectory(dir=TMP) as td:
                 pathToTmpFile = Path(td) / tmpFileName
                 with open(pathToTmpFile, "wb") as f:
-                    #TODO continue working on this yo uneed to add two separate data reads based on what library we are using
+                    if reqType == "req":
+                        async for n, chunk in cls.DeFrame(req.stream()):#TODO figure the async iterable shit out at the end
+                            total = _CheckSize(chunk, total)
+                            chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
+                            f.write(chunk)
 
-
+                    elif reqType == "resp":
+                        for n, chunk in cls.DeFrame(req.iter_content(chunk_size= chunkSize)):
+                            total = _CheckSize(chunk, total)
+                            chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
+                            f.write(chunk)
+                    else:
+                        raise ParsingError("Fym u ran out of options... HOW!?")
         else:
-            # ============SINGLE=============
-            ...
+            if contentType == ContentType.JSON:
+                ...
+            elif contentType == ContentType.SMALL_FILE:
+                ...
+            else:
+                raise ParsingError("Tried Using non existant content type lmao")
+
 
 
 
@@ -94,9 +120,9 @@ class ASHTPBase:
         return a
 
     @classmethod
-    def TearOpen(cls, msg:bytes, method:str, path:str, serverCount:int, session:Session, sessionId:bytes, ref:int|None = None) -> dict:
+    def TearOpen(cls, msg:bytes, method:str, path:str, serverCount:int, session:Session, sessionId:bytes, ref:int|None = None) -> bytes:
         """
-        Turns encrypted byte data into (hopefuly) a readable piece of JSON
+        Turns encrypted byte data into just byte data
 
         :param ref:
         :param serverCount:
@@ -116,7 +142,7 @@ class ASHTPBase:
         tag = ASHTPBase.Aad(sessionId, method, path, ref=ref)
         plain  = session.Decrypt(msg, n, tag)
 
-        return json.loads(plain.decode())
+        return plain
 
     @classmethod
     def Seal(cls, msg:bytes, method:str, path:str,session:Session, sessionId:bytes, ref:int|None = None) -> tuple[bytes, int]:
@@ -179,8 +205,47 @@ class ASHTPBase:
         :param counter:
         :return:
         """
+        total = 0
         for chunk in gen:
-            yield struct.pack(">QI", counter, len(chunk)) + chunk
+            if len(chunk) > CHUNK_SIZE_LIMIT:
+                raise ContentTooLarge("Trying to frame a chunk that is bigger than the limit")
+
+            total += len(chunk)
+            if total > FILE_SIZE_LIMIT:
+                raise ContentTooLarge("Can not frame past file size limit")
+
+            yield _HDR.pack(counter, len(chunk)) + chunk
+
+    @classmethod
+    def DeFrame(cls, gen):
+        """
+        Destructure a frame around every chunk
+
+        :param gen:
+        :return:
+        """
+        total = 0
+        for chunk in gen:
+            if len(chunk) > CHUNK_SIZE_LIMIT + _HDR.size:
+                raise ContentTooLarge("Trying to de-frame a chunk which is too big")
+
+            if len(chunk) < _HDR.size:
+                raise MalformedHeader("Chunk too small to de-frame")
+
+            n, lng = _HDR.unpack(chunk[:_HDR.size])
+
+            if lng > CHUNK_SIZE_LIMIT:
+                raise ContentTooLarge("Trying to de-frame a chunk which header states to be too big")
+
+            if lng != len(chunk) - _HDR.size:
+                raise MalformedHeader("Trying to de-frame a chunk with faulty len header")
+
+            total += lng
+            if total > FILE_SIZE_LIMIT:
+                raise ContentTooLarge("Can not de-frame past file size limit")
+
+            chunk = chunk[_HDR.size:]
+            yield n, chunk
 
     @classmethod
     def SealFileStream(cls, meta:dict, filePath:Path, method:str, path:str, session:Session, sessionId:bytes, chunkSize:int=65*1024
