@@ -10,8 +10,9 @@ SUPPORTED_SERVER_VERSIONS = [PROTOCOL_VERSION] # btw ts will never support more 
 
 TMP = Path(tempfile.gettempdir()) / "ashtp" / "S"
 TMP.mkdir(parents=True, exist_ok=True)
-#TODO put most of theese values into a generated config on import,
-# make it so the values are accsesible to the module and make them be loaded into memory on import
+EXTRACT_RESULTS = Path(tempfile.gettempdir()) / "ashtp" / "S" / "extracted"
+EXTRACT_RESULTS.mkdir(parents=True, exist_ok=True)
+
 CHUNK_SIZE_LIMIT = 258 * 1024 # 258 KiB
 FILE_PACKAGE_SIZE_LIMIT = 16 * 1024 * 1024 # 16 MiB
 JSON_PACKAGE_SIZE_LIMIT = 1024 * 1024 # 1 MiB

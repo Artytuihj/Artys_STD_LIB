@@ -17,3 +17,5 @@ class ASHTPGeneralException(Exception):
     pass
 class MalformedHeader(Exception):
     pass
+class TamperedPackage(Exception):
+    pass

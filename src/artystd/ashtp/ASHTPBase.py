@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import random
@@ -6,7 +7,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterator
-from zipfile import ZIP_FILECOUNT_LIMIT
+import shutil
 
 from charset_normalizer import from_path
 from cryptography.hazmat.primitives import hashes
@@ -15,16 +16,48 @@ from pydantic.v1 import JsonError
 from requests import Response
 from fastapi import Request
 
-from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT, JSON_PACKAGE_SIZE_LIMIT, FILE_PACKAGE_SIZE_LIMIT
+from artystd.ashtp import TMP, CHUNK_SIZE_LIMIT, FILE_SIZE_LIMIT, JSON_PACKAGE_SIZE_LIMIT, FILE_PACKAGE_SIZE_LIMIT, \
+    EXTRACT_RESULTS
 from artystd.ashtp.ASHTPEnums import ContentType, BaseHeaders
-from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, MalformedHeader
+from artystd.ashtp.ASHTPExceptions import ContentTooLarge, HandshakeError, ParsingError, MalformedHeader, \
+    TamperedPackage
 from artystd.ashtp.Session import Session
 
 _HDR = struct.Struct(">QI") # the header template
 
+
+def _SafeUnzip(path: Path, dest: Path):
+    dest = dest.resolve()
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if (bad := zf.testzip()) is not None:
+                raise TamperedPackage(f"Package was tampered with or is corrupted: {bad}")
+
+            for file in zf.infolist():
+                target = (dest / file.filename).resolve()
+                if not target.is_relative_to(dest):
+                    raise TamperedPackage(f"Zip-Slip detected at file: {file.filename} to {target}")
+
+            zf.extractall(dest)
+
+    except Exception as e:
+        shutil.rmtree(dest, ignore_errors=True)  # delete the leftovers
+        if isinstance(e, zipfile.BadZipFile):
+            raise TamperedPackage("Package is not a valid zip file") from e
+        raise
+
+def _CheckSize(chk: bytes, ttl) -> int:
+    if len(chk) > CHUNK_SIZE_LIMIT:
+        raise ContentTooLarge("Received chunk size exceeded the limit")
+    ttl += len(chk)
+    if ttl > FILE_SIZE_LIMIT:
+        raise ContentTooLarge("File size exceeded the limit")
+    return ttl
+
 class ASHTPBase:
+
     @classmethod
-    async def ReadBody(cls, req: Request | Response, session:Session, sessionId:bytes):
+    async def ReadBody(cls, req: Request | Response, session: Session, sessionId: bytes) -> dict:
         """
         Takes a Request item and unpacks + decrypts it into usable data
 
@@ -46,48 +79,54 @@ class ASHTPBase:
             contentType = ContentType(str(contentType))
             chunkSize = int(chunkSize)
             counter = int(counter)
-        except ValueError:
+        except (ValueError, TypeError):
             raise ParsingError("Received an unexpected header value")
 
         if contentType.isStream:
             # ============STREAM=============
             total = 0
-
-            def _CheckSize(chk: bytes, ttl) -> int:
-                if len(chk) > CHUNK_SIZE_LIMIT:
-                    raise ContentTooLarge("Received chunk size exceeded the limit")
-                ttl += len(chk)
-                if ttl > FILE_SIZE_LIMIT:
-                    raise ContentTooLarge("File size exceeded the limit")
-                return ttl
+            written = 0
 
             if chunkSize > CHUNK_SIZE_LIMIT or contentSize > FILE_SIZE_LIMIT:
                 raise ContentTooLarge("File or Chunk size exceeded the limit")
+
+            def _WriteRespStream(f) -> tuple[int, int]:
+                ttl = 0
+                wrt = 0
+                for n, chunk in cls.DeFrame(req.iter_content(chunk_size=chunkSize)):
+                    ttl = _CheckSize(chunk, ttl)
+                    chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
+                    f.write(chunk)
+                    wrt += len(chunk)
+                return ttl, wrt
 
             with tempfile.TemporaryDirectory(dir=TMP) as td:
                 pathToTmpFile = Path(td) / tmpFileName
                 with open(pathToTmpFile, "wb") as f:
                     if reqType == "req":
-                        async for n, chunk in cls.DeFrame(req.stream()):#TODO figure the async iterable shit out at the end
+                        async for n, chunk in cls.AsyncDeFrame(req.stream()):
                             total = _CheckSize(chunk, total)
                             chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
                             f.write(chunk)
+                            written += len(chunk)
 
                     elif reqType == "resp":
-                        for n, chunk in cls.DeFrame(req.iter_content(chunk_size= chunkSize)):
-                            total = _CheckSize(chunk, total)
-                            chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
-                            f.write(chunk)
+                        total, written = await asyncio.to_thread(_WriteRespStream, f)
                     else:
                         raise ParsingError("Fym u ran out of options... HOW!?")
-                #TODO unzip and return [1]
+
+                if written != contentSize:
+                    raise TamperedPackage(f"Stream size mismatch: header said {contentSize}, received {written}")
+
+                outputPath = EXTRACT_RESULTS / tmpFileName
+                await asyncio.to_thread(_SafeUnzip, pathToTmpFile, outputPath)
+                return {"file": str(outputPath)}
         else:
             data: bytes
             if reqType == "req":
                 data = await req.body()
             elif reqType == "resp":
                 data = req.content
-
             if contentType == ContentType.JSON:
                 if len(data) > JSON_PACKAGE_SIZE_LIMIT:
                     raise ContentTooLarge("Json size exceeded the limit")
@@ -110,14 +149,12 @@ class ASHTPBase:
                     with open(pathToTmpFile, "wb") as f:
                         f.write(plain)
 
-                        #TODO add file unzip and retutn reutns
-                        #for here and [1] add a _helper method
+                    outputPath = EXTRACT_RESULTS / tmpFileName
 
+                    await asyncio.to_thread(_SafeUnzip, pathToTmpFile, outputPath)
+                    return {"file": str(outputPath)}
             else:
                 raise ParsingError("Tried Using non existant content type lmao")
-
-
-
 
     @classmethod
     def DeriveKeys(cls, secret: bytes, transcrypt: bytes, length: int = 64) -> tuple[bytes, bytes]:
@@ -197,19 +234,19 @@ class ASHTPBase:
         return data, n
 
     @classmethod
-    def Parse(cls, msg: dict, fmt: dict)-> dict:
+    def Parse(cls, msg: dict, template: dict)-> dict:
         """
         takes a dict and compares it to a template
 
         :param msg:
-        :param fmt:
+        :param template:
         :return:
         """
-        if not isinstance(msg, dict) or set(msg) - set(fmt):
+        if not isinstance(msg, dict) or set(msg) - set(template):
             raise ParsingError("msg inst a dict or has forbidden fields")
         output = {}
 
-        for name , spec in fmt.items():
+        for name , spec in template.items():
             if name not in msg:
                 if spec["required"]:
                     raise ParsingError("msg is missing keys defined in template")
@@ -221,7 +258,7 @@ class ASHTPBase:
                 except Exception as e:
                     raise ParsingError(f"{name} isn't bytes or the field is corrupted")
 
-                if len(value) != spec["len"]:#todo add suppoort for the size header
+                if len(value) != spec["len"]:
                     raise ParsingError(f"{name} dosen't match length target")
             elif not isinstance(value, spec["type"]):
                 raise ParsingError(f"{name} dosen't match type")
@@ -280,8 +317,38 @@ class ASHTPBase:
             yield n, chunk
 
     @classmethod
-    def SealFileStream(cls, meta:dict, filePath:Path, method:str, path:str, session:Session, sessionId:bytes, chunkSize:int=65*1024
-                       , ref:int|None = None) -> Iterator[tuple[bytes, int]]:
+    async def AsyncDeFrame(cls, gen):
+        """
+        Destructure a frame around every chunk
+
+        :param gen:
+        :return:
+        """
+        total = 0
+        async for chunk in gen:
+            if len(chunk) > CHUNK_SIZE_LIMIT + _HDR.size:
+                raise ContentTooLarge("Trying to de-frame a chunk which is too big")
+
+            if len(chunk) < _HDR.size:
+                raise MalformedHeader("Chunk too small to de-frame")
+
+            n, lng = _HDR.unpack(chunk[:_HDR.size])
+
+            if lng > CHUNK_SIZE_LIMIT:
+                raise ContentTooLarge("Trying to de-frame a chunk which header states to be too big")
+
+            if lng != len(chunk) - _HDR.size:
+                raise MalformedHeader("Trying to de-frame a chunk with faulty len header")
+
+            total += lng
+            if total > FILE_SIZE_LIMIT:
+                raise ContentTooLarge("Can not de-frame past file size limit")
+
+            chunk = chunk[_HDR.size:]
+            yield n, chunk
+
+    @classmethod
+    def SealFileStream(cls, meta:dict, filePath:Path, method:str, path:str, session:Session, sessionId:bytes, chunkSize:int=65*1024, ref:int|None = None) -> Iterator[tuple[bytes, int]]:
         """ Turns an unencrypted File into request ready byte stream
 
         :param chunkSize:
