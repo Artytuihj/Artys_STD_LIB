@@ -12,7 +12,6 @@ import shutil
 from charset_normalizer import from_path
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from pydantic.v1 import JsonError
 from requests import Response
 from fastapi import Request
 
@@ -57,12 +56,15 @@ def _CheckSize(chk: bytes, ttl) -> int:
 class ASHTPBase:
 
     @classmethod
-    async def ReadBody(cls, req: Request | Response, session: Session, sessionId: bytes) -> dict:
+    async def ReadBody(cls, req: Request | Response, session: Session, sessionId: bytes, ref: int | None = None) -> dict:
         """
         Takes a Request item and unpacks + decrypts it into usable data
 
         :param req:
-        :return:
+        :param session:
+        :param sessionId:
+        :param ref: counter of the request this body is an answer to (replies only, None when reading a request)
+        :return: json -> the dict itself, streams -> {"file": <extracted dir>, "meta": <first frame>}
         """
 
         contentSize = req.headers.get(BaseHeaders.SIZE)
@@ -73,6 +75,9 @@ class ASHTPBase:
         tmpFileName = random.randbytes(20).hex()
 
         reqType = "req" if isinstance(req, Request) else "resp"
+
+        method = req.method if reqType == "req" else req.request.method
+        url = str(req.url)
 
         try:
             contentSize = int(contentSize)
@@ -86,41 +91,51 @@ class ASHTPBase:
             # ============STREAM=============
             total = 0
             written = 0
+            meta = None
 
             if chunkSize > CHUNK_SIZE_LIMIT or contentSize > FILE_SIZE_LIMIT:
                 raise ContentTooLarge("File or Chunk size exceeded the limit")
 
-            def _WriteRespStream(f) -> tuple[int, int]:
-                ttl = 0
-                wrt = 0
+            def _Handle(f, n: int, chunk: bytes):
+                nonlocal total, written, meta
+                total = _CheckSize(chunk, total)
+                plain = cls.TearOpen(chunk, method, url, n, session, sessionId, ref)
+                if meta is None:
+                    try:
+                        meta = json.loads(plain)
+                    except ValueError:
+                        raise ParsingError("Stream metadata frame is not valid json")
+                    if not isinstance(meta, dict):
+                        raise ParsingError("Stream metadata frame is not a dict")
+                    return
+                f.write(plain)
+                written += len(plain)
+
+            def _WriteRespStream(f):
                 for n, chunk in cls.DeFrame(req.iter_content(chunk_size=chunkSize)):
-                    ttl = _CheckSize(chunk, ttl)
-                    chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
-                    f.write(chunk)
-                    wrt += len(chunk)
-                return ttl, wrt
+                    _Handle(f, n, chunk)
 
             with tempfile.TemporaryDirectory(dir=TMP) as td:
                 pathToTmpFile = Path(td) / tmpFileName
                 with open(pathToTmpFile, "wb") as f:
                     if reqType == "req":
                         async for n, chunk in cls.AsyncDeFrame(req.stream()):
-                            total = _CheckSize(chunk, total)
-                            chunk = cls.TearOpen(chunk, req.method, str(req.url), n, session, sessionId)
-                            f.write(chunk)
-                            written += len(chunk)
+                            _Handle(f, n, chunk)
 
                     elif reqType == "resp":
-                        total, written = await asyncio.to_thread(_WriteRespStream, f)
+                        await asyncio.to_thread(_WriteRespStream, f)
                     else:
                         raise ParsingError("Fym u ran out of options... HOW!?")
+
+                if meta is None:
+                    raise MalformedHeader("Stream carried no frames")
 
                 if written != contentSize:
                     raise TamperedPackage(f"Stream size mismatch: header said {contentSize}, received {written}")
 
                 outputPath = EXTRACT_RESULTS / tmpFileName
                 await asyncio.to_thread(_SafeUnzip, pathToTmpFile, outputPath)
-                return {"file": str(outputPath)}
+                return {"file": str(outputPath), "meta": meta}  # EDIT [B3]: meta is needed for user headers / chunk_size
         else:
             data: bytes
             if reqType == "req":
@@ -131,10 +146,10 @@ class ASHTPBase:
                 if len(data) > JSON_PACKAGE_SIZE_LIMIT:
                     raise ContentTooLarge("Json size exceeded the limit")
 
-                plain = cls.TearOpen(data, req.method, str(req.url), counter, session, sessionId)
+                plain = cls.TearOpen(data, method, url, counter, session, sessionId, ref)
                 try:
                     notSoPlain = json.loads(plain)
-                except JsonError:
+                except ValueError:
                     raise ParsingError("Couldnt parse bytes into json ")
 
                 return notSoPlain
@@ -142,7 +157,7 @@ class ASHTPBase:
                 if len(data) > FILE_PACKAGE_SIZE_LIMIT:
                     raise ContentTooLarge("Small File size exceeded the limit")
 
-                plain = cls.TearOpen(data, req.method, str(req.url), counter, session, sessionId)
+                plain = cls.TearOpen(data, method, url, counter, session, sessionId, ref)
 
                 with tempfile.TemporaryDirectory(dir=TMP) as td:
                     pathToTmpFile = Path(td) / tmpFileName
@@ -214,9 +229,9 @@ class ASHTPBase:
         return plain
 
     @classmethod
-    def Seal(cls, msg:bytes, method:str, path:str,session:Session, sessionId:bytes, ref:int|None = None) -> tuple[bytes, int]:
+    def Seal(cls, msg:dict|bytes, method:str, path:str,session:Session, sessionId:bytes, ref:int|None = None) -> tuple[bytes, int]:
         """ Turns unencrypted JSON into request ready data
-        #TODO go around and make sure that every thing seals with a FULL URL
+
         :param ref:
         :param sessionId:
         :param session:
@@ -227,7 +242,11 @@ class ASHTPBase:
         """
 
 
-        plain = json.dumps(msg).encode()
+        if isinstance(msg, (bytes, bytearray)):
+            plain = bytes(msg)
+        else:
+            plain = json.dumps(msg).encode()
+
         tag = ASHTPBase.Aad(sessionId, method, path, ref=ref)
         n, data = session.Encrypt(plain, tag)
 
@@ -255,7 +274,7 @@ class ASHTPBase:
             if spec["type"] is bytes:
                 try:
                     value = base64.b64decode(value, validate=True)
-                except Exception as e:
+                except Exception:
                     raise ParsingError(f"{name} isn't bytes or the field is corrupted")
 
                 if len(value) != spec["len"]:
@@ -266,16 +285,15 @@ class ASHTPBase:
         return output
 
     @classmethod
-    def Frame(cls, gen, counter):
+    def Frame(cls, gen):
         """
         adds a frame around every chunk with its metadata
 
-        :param gen:
-        :param counter:
+        :param gen: iterator of (sealed chunk, counter used to seal it) -> what SealFileStream yields
         :return:
         """
         total = 0
-        for chunk in gen:
+        for chunk, n in gen:
             if len(chunk) > CHUNK_SIZE_LIMIT:
                 raise ContentTooLarge("Trying to frame a chunk that is bigger than the limit")
 
@@ -283,76 +301,97 @@ class ASHTPBase:
             if total > FILE_SIZE_LIMIT:
                 raise ContentTooLarge("Can not frame past file size limit")
 
-            yield _HDR.pack(counter, len(chunk)) + chunk
+            yield _HDR.pack(n, len(chunk)) + chunk
+
+    @classmethod
+    def _PopFrames(cls, buf: bytearray, total: int) -> tuple[list[tuple[int, bytes]], int]:
+        """
+        Cuts every complete frame out of buf (in place) and leaves a partial one for the next call
+
+        :param buf: bytes received so far and not consumed
+        :param total: payload bytes already de-framed in this stream
+        :return: the frames + the new running total
+        """
+        frames = []
+        while len(buf) >= _HDR.size:
+            n, lng = _HDR.unpack_from(buf)
+
+            if lng > CHUNK_SIZE_LIMIT:
+                raise ContentTooLarge("Trying to de-frame a chunk which header states to be too big")
+
+            if len(buf) < _HDR.size + lng:
+                break  # rest of the frame hasn't arrived yet
+
+            total += lng
+            if total > FILE_SIZE_LIMIT:
+                raise ContentTooLarge("Can not de-frame past file size limit")
+
+            frames.append((n, bytes(buf[_HDR.size:_HDR.size + lng])))
+            del buf[:_HDR.size + lng]
+        return frames, total
 
     @classmethod
     def DeFrame(cls, gen):
         """
         Destructure a frame around every chunk
 
-        :param gen:
+        :param gen: iterator of raw byte pieces as they came off the wire
         :return:
         """
         total = 0
-        for chunk in gen:
-            if len(chunk) > CHUNK_SIZE_LIMIT + _HDR.size:
-                raise ContentTooLarge("Trying to de-frame a chunk which is too big")
-
-            if len(chunk) < _HDR.size:
-                raise MalformedHeader("Chunk too small to de-frame")
-
-            n, lng = _HDR.unpack(chunk[:_HDR.size])
-
-            if lng > CHUNK_SIZE_LIMIT:
-                raise ContentTooLarge("Trying to de-frame a chunk which header states to be too big")
-
-            if lng != len(chunk) - _HDR.size:
-                raise MalformedHeader("Trying to de-frame a chunk with faulty len header")
-
-            total += lng
-            if total > FILE_SIZE_LIMIT:
-                raise ContentTooLarge("Can not de-frame past file size limit")
-
-            chunk = chunk[_HDR.size:]
-            yield n, chunk
+        buf = bytearray()
+        for piece in gen:
+            buf += piece
+            frames, total = cls._PopFrames(buf, total)
+            yield from frames
+        if buf:
+            raise MalformedHeader("Stream ended in the middle of a frame")
 
     @classmethod
     async def AsyncDeFrame(cls, gen):
         """
         Destructure a frame around every chunk
 
-        :param gen:
+        :param gen: async iterator of raw byte pieces as they came off the wire
         :return:
         """
         total = 0
-        async for chunk in gen:
-            if len(chunk) > CHUNK_SIZE_LIMIT + _HDR.size:
-                raise ContentTooLarge("Trying to de-frame a chunk which is too big")
-
-            if len(chunk) < _HDR.size:
-                raise MalformedHeader("Chunk too small to de-frame")
-
-            n, lng = _HDR.unpack(chunk[:_HDR.size])
-
-            if lng > CHUNK_SIZE_LIMIT:
-                raise ContentTooLarge("Trying to de-frame a chunk which header states to be too big")
-
-            if lng != len(chunk) - _HDR.size:
-                raise MalformedHeader("Trying to de-frame a chunk with faulty len header")
-
-            total += lng
-            if total > FILE_SIZE_LIMIT:
-                raise ContentTooLarge("Can not de-frame past file size limit")
-
-            chunk = chunk[_HDR.size:]
-            yield n, chunk
+        buf = bytearray()
+        async for piece in gen:
+            buf += piece
+            frames, total = cls._PopFrames(buf, total)
+            for frame in frames:
+                yield frame
+        if buf:
+            raise MalformedHeader("Stream ended in the middle of a frame")
 
     @classmethod
-    def SealFileStream(cls, meta:dict, filePath:Path, method:str, path:str, session:Session, sessionId:bytes, chunkSize:int=65*1024, ref:int|None = None) -> Iterator[tuple[bytes, int]]:
+    def PackZip(cls, src: Path, destDir: Path) -> Path:
+        """
+        Zips a file or a folder into destDir
+
+        :param src: file or folder to pack
+        :param destDir: where the zip is written, caller owns the cleanup
+        :return: path of the zip
+        """
+        zipPath = destDir / f"{src.name}.zip"
+        with zipfile.ZipFile(zipPath, "w", zipfile.ZIP_DEFLATED) as zf:
+            if src.is_file():
+                zf.write(src, arcname=src.name)
+            else:
+                for file in src.rglob("*"):
+                    if file.is_dir():
+                        zf.write(file, arcname=str(file.relative_to(src)) + "/")
+                    else:
+                        zf.write(file, arcname=file.relative_to(src))
+        return zipPath
+
+    @classmethod
+    def SealFileStream(cls, meta:dict, zipPath:Path, method:str, path:str, session:Session, sessionId:bytes, chunkSize:int=65*1024, ref:int|None = None) -> Iterator[tuple[bytes, int]]:  # EDIT [B8]: takes the finished zip (see PackZip) instead of a folder
         """ Turns an unencrypted File into request ready byte stream
 
         :param chunkSize:
-        :param filePath:
+        :param zipPath: zip made with PackZip
         :param meta:
         :param method:
         :param path:
@@ -362,24 +401,15 @@ class ASHTPBase:
         :return:
         """
 
-        initialRequest = json.dumps( meta | {"chunk_size": chunkSize} ).encode()#todo add support for the new headers
-        with tempfile.TemporaryDirectory(dir=TMP) as td: # niche thing i like
+        initialRequest = json.dumps( meta ).encode()
 
-            zipPath = Path(td) / f"{filePath.name}.zip"
-            with zipfile.ZipFile(zipPath, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file in filePath.rglob("*"):
-                    if file.is_dir():
-                        zf.write(file, arcname=str(file.relative_to(filePath)) + "/")
-                    else:
-                        zf.write(file, arcname=file.relative_to(filePath))
+        data, n = cls.Seal(initialRequest, method, path, session, sessionId, ref)
+        yield data, n
 
-            data, n = cls.Seal(initialRequest, method, path, session, sessionId, ref)
-            yield data, n
-
-            with zipPath.open("rb") as f:
-                while chunk := f.read(chunkSize):
-                    data, n = cls.Seal(chunk, method, path, session, sessionId, ref)
-                    yield data, n
+        with zipPath.open("rb") as f:
+            while chunk := f.read(chunkSize):
+                data, n = cls.Seal(chunk, method, path, session, sessionId, ref)
+                yield data, n
 
     @classmethod
     def StandardHeaders(cls,contentType:ContentType, sessionId:bytes, counter:int, sendUHeaders:bool, size:int, chunkSize:None|int = None):
@@ -394,11 +424,12 @@ class ASHTPBase:
         :param chunkSize:
         :return:
         """
+
         return{
             f"{BaseHeaders.SESSION}": base64.b64encode(sessionId).decode(),
             f"{BaseHeaders.COUNTER}": str(counter),
             f"{BaseHeaders.CONTENT_TYPE}": str(contentType),
-            f"{BaseHeaders.INCL_HEADERS}": sendUHeaders,
+            f"{BaseHeaders.INCL_HEADERS}": "1" if sendUHeaders else "0",
             f"{BaseHeaders.SIZE}":str(size),
-            f"{BaseHeaders.CHUNK_SIZE}": str(chunkSize) if chunkSize else -1
+            f"{BaseHeaders.CHUNK_SIZE}": str(chunkSize) if chunkSize else "-1"
         }

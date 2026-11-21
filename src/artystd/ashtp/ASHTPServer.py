@@ -1,5 +1,7 @@
 import asyncio
 import json
+import shutil  # EDIT [S1]: needed by _FileReply cleanup
+import tempfile  # EDIT [S1]: needed by _FileReply
 import time
 from collections import deque
 from pathlib import Path
@@ -10,17 +12,19 @@ from cryptography.hazmat.primitives import serialization
 import base64
 import hashlib
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse  # EDIT [S1]: file replies
 import logging
 import inspect
 
 from dataclasses import dataclass, field
 import secrets
 
-from src.artystd.ashtp import PROTOCOL_VERSION, SUPPORTED_SERVER_VERSIONS
+from artystd.ashtp import PROTOCOL_VERSION, SUPPORTED_SERVER_VERSIONS, TMP, HANDSHAKE_PASS_PHRASE  # EDIT [S1]: was `src.artystd...` (Base uses `artystd...`, two names = two module copies); + TMP / HANDSHAKE_PASS_PHRASE
 from . import idr
+from .ASHTPEnums import BaseHeaders, ContentType  # EDIT [S1]: ContentType
 from .IKeyAuthority import IKeyAuthority as ika
 from .Session import Session
-from .ASHTPExceptions import ParsingError, HandshakeError, ReplayError, ContentTooLarge, ClientTooOldError, KeyLacksPermissionError
+from .ASHTPExceptions import ParsingError, HandshakeError, ReplayError, ContentTooLarge, ClientTooOldError, KeyLacksPermissionError, MalformedHeader, TamperedPackage  # EDIT [S1]: + MalformedHeader, TamperedPackage (ReadBody raises them)
 from .ASHTPBase import ASHTPBase
 
 @dataclass
@@ -52,11 +56,12 @@ class RateLimiter:#neat  thingy
     def Hit(self, key: str):
         self._Trim(key).append(time.monotonic())# add to the counter
 
-class ASHTPServer:#TODO update header signatures
+class ASHTPServer:
     def __init__(self,
                  application:type[FastAPI],
                  server_private_encryption_const: bytes,
                  key_authority: ika,
+                 url_body: str,
                  url_prefix: str = "http://",
                  url_health: str = "/health",
                  url_handshake: str = "/privet",
@@ -72,6 +77,7 @@ class ASHTPServer:#TODO update header signatures
 
         # ------- server address --------
         self.serverPrefix: str = url_prefix
+        self.serverBody: str = url_body
         self.serverHealthEndpoint: str = url_health
         self.serverHandshakeEndpoint: str = url_handshake
         self.serverAuthEndpoint: str = url_auth
@@ -107,9 +113,11 @@ class ASHTPServer:#TODO update header signatures
 
         # ------- app --------
         self.app = application
-        self.app.add_api_route("/health", self.Health, methods=["GET"])
-        self.app.add_api_route("/privet", self.Handshake, methods=["POST"])
-        self.app.add_api_route("/auth", self.Authenticate, methods=["POST"])
+
+        self.app.add_api_route(self.serverHealthEndpoint, self.Health, methods=["GET"])
+        self.app.add_api_route(self.serverHandshakeEndpoint, self.Handshake, methods=["POST"])
+        self.app.add_api_route(self.serverAuthEndpoint, self.Authenticate, methods=["POST"])
+
 
     # --------- tool chain --------
     def Log(self, message:str):
@@ -124,47 +132,122 @@ class ASHTPServer:#TODO update header signatures
             if s.permsLevel == -1 and now - s.created > max_age:
                 del self.activeSessions[sid]
 
-    def Endpoint(self, path:str, method:str, minPerms:int|None = None, baseModel:dict|None = None, maxBody:int = 16 * 1024):
+    # >>> EDIT [S4] two helpers used by the handlers below
+    async def _ReadPlain(self, req: Request, limit: int) -> bytes:
+        """
+        Reads an UNENCRYPTED body (only the handshake hello is) with a size cap.
+        Needed because ReadBody always decrypts, so it can't be used before a session exists.
+        """
+        declared = req.headers.get("content-length")
+        if declared is not None and int(declared) > limit:
+            raise ContentTooLarge("Body larger than allowed")
+        body = await req.body()
+        if len(body) > limit:
+            raise ContentTooLarge("Body larger than allowed")
+        return body
+
+    def _FileReply(self, src: Path, method: str, url: str, active: ActiveSession, sid: bytes, counter: int,
+                   chunkSize: int = 64 * 1024) -> StreamingResponse:
+        """
+        Builds the reply for a handler that returned a Path: zip -> seal chunk by chunk -> frame, streamed.
+        The zip is built up front because the size header has to be known before the first byte is sent.
+        """
+        td = tempfile.mkdtemp(dir=TMP)
+        try:
+            zipPath = ASHTPBase.PackZip(src, Path(td))
+            size = zipPath.stat().st_size
+        except Exception:
+            shutil.rmtree(td, ignore_errors=True)
+            raise
+
+        def body():
+            try:
+                yield from ASHTPBase.Frame(
+                    ASHTPBase.SealFileStream({}, zipPath, method, url, active.session, sid, chunkSize, ref=counter))
+            finally:
+                shutil.rmtree(td, ignore_errors=True)  # delete the zip once streamed (or the client dropped)
+
+        # counter header is informational for streams (every frame carries its own n), the request counter keeps it simple
+        headers = ASHTPBase.StandardHeaders(ContentType.FILE_STREAM, sid, counter, False, size, chunkSize)
+        return StreamingResponse(body(), headers=headers, media_type="application/octet-stream")
+
+
+    def Endpoint(self, path:str, method:str, minPerms:int|None = None, baseModel:dict|None = None, maxBody:int = 16 * 1024):#todo adjust the size limits
         method = method.upper()
 
         def decorator(fn):
+
             async def endpoint(req:Request):
-                # unpack the request
+                url = str(req.url)
                 try:
-                    sid = base64.b64decode(req.headers["ashtp-Session"])
+                    sid = base64.b64decode(req.headers[BaseHeaders.SESSION])
                     active = self.activeSessions.get(sid)
                     requiredPermissionLevel = self.keyAuthority.minPermissionLevel if minPerms is None else minPerms
 
-
-                    if active is None or not self.keyAuthority.ComparePermissions(active.permsLevel, requiredPermissionLevel):
+                    if active is None or active.permsLevel < 0:
+                        return Response(status_code=401)# no/unauthenticated session -> client must re-handshake
+                    if not self.keyAuthority.ComparePermissions(active.permsLevel, requiredPermissionLevel):
                         return Response(status_code=403)# forbidden request
 
-                    counter = int(req.headers["ashtp-Counter"])
+                    counter = int(req.headers[BaseHeaders.COUNTER])
+                    contentType = ContentType(req.headers[BaseHeaders.CONTENT_TYPE])
+                    sendsUHeaders = req.headers.get(BaseHeaders.INCL_HEADERS) == "1"
 
-                    contents, headers = ASHTPBase.TearOpen(await ASHTPBase.ReadBody(req, maxBody), method, path, counter, active.session, sid)
-                    if baseModel: contents = ASHTPBase.Parse(contents, baseModel)
+                    if contentType == ContentType.JSON and int(req.headers.get("content-length", 0)) > maxBody:
+                        raise ContentTooLarge("Body larger than this endpoint allows")  # maxBody was an unused param
 
-                except (KeyError, ValueError, ReplayError, InvalidTag) as e:
-                    self.Error(f"{path}: {e}")
-                    return Response(status_code=400) # broken request
+                    contents = await ASHTPBase.ReadBody(req, active.session, sid)
+
+                    # json -> the dict is the payload, stream -> the payload is the metadata frame
+                    holder = contents["meta"] if contentType.isStream else contents
+                    if not isinstance(holder, dict):
+                        raise ParsingError("payload isn't a dict")
+                    holder.pop("chunk_size", None)  # added by SealFileStream, not part of the user's fields
+
+                    userHeaders = {}
+                    if sendsUHeaders:
+                        raw = holder.pop("user_headers", {})
+                        if not isinstance(raw, dict):
+                            raise ParsingError("user_headers isn't a dict")
+                        userHeaders = {k: base64.b64decode(v, validate=True) for k, v in raw.items()}
+
+                    if baseModel:
+                        holder = ASHTPBase.Parse(holder, baseModel)
+                        if contentType.isStream:
+                            contents["meta"] = holder
+                        else:
+                            contents = holder
+
                 except ContentTooLarge:
                     return Response(status_code=413) # body too large
+                except HandshakeError as e:
+                    self.Error(f"{path}: {e}")
+                    return Response(status_code=401)
+                except (KeyError, ValueError, TypeError, ReplayError, InvalidTag, ParsingError, MalformedHeader, TamperedPackage) as e:
+                    self.Error(f"{path}: {e}")
+                    return Response(status_code=400) # broken request
 
                 # handle request
                 try:
                     if inspect.iscoroutinefunction(fn):
-                        result = await fn(active, contents, headers)
+                        result = await fn(active, contents, userHeaders)
                     else:
-                        result = await asyncio.to_thread(fn, active, contents, headers)
+                        result = await asyncio.to_thread(fn, active, contents, userHeaders)
                 except Exception as e:
                     self.Error(f"{path} handler failed: {e}")
                     return Response(status_code=500) # random error
+
+                # a handler returns a dict (-> json reply) or a Path to a file/folder (-> file stream reply)
                 try:
-                    data, headers, _ = ASHTPBase.Seal(result, method, path,active.session, sid, ref=counter)#TODO update seals and tears to a new standard
-                    return Response(content=data, headers=headers, media_type="application/octet-stream")
-                except KeyError as e:
-                    self.Log(str(e))
-                    return Response(status_code=401) # Unotorised
+                    if isinstance(result, Path):
+                        return self._FileReply(result, method, url, active, sid, counter)
+                    data, n = ASHTPBase.Seal(result, method, url, active.session, sid, ref=counter)
+                    replyHeaders = ASHTPBase.StandardHeaders(ContentType.JSON, sid, n, False, len(data))
+                    return Response(content=data, headers=replyHeaders, media_type="application/octet-stream")
+                except Exception as e:
+                    self.Error(f"{path} couldn't seal the reply: {e}")
+                    return Response(status_code=500)
+
 
             self.app.add_api_route(path, endpoint, methods=[method])
             return fn
@@ -184,8 +267,8 @@ class ASHTPServer:#TODO update header signatures
         self.Expire() # remove old sessions to prevent overflow
 
         try:
-            body = await ASHTPBase.ReadBody(request, 1024)
-            raw = ASHTPBase.Parse(json.loads(body), self.HELLO_FORMAT)#TODO body is angry ova here check it out later
+            body = await self._ReadPlain(request, 1024)
+            raw = ASHTPBase.Parse(json.loads(body), self.HELLO_FORMAT)
 
 
             proto = raw["protocol"]
@@ -221,7 +304,7 @@ class ASHTPServer:#TODO update header signatures
                 del self.activeSessions[min(unauth)[1]]
 
             self.activeSessions[sessionId] = ActiveSession(session=session)
-            n, ct = session.Encrypt(b"lets go", b"")
+            n, ct = session.Encrypt(HANDSHAKE_PASS_PHRASE, b"")
             reply = {
                 "F":          base64.b64encode( Fb ).decode(),
                 "session_id": base64.b64encode( sessionId ).decode(),
@@ -238,17 +321,23 @@ class ASHTPServer:#TODO update header signatures
 
     async def Authenticate(self, request: Request):
         try:
-            raw = await ASHTPBase.ReadBody(request, 2 * 1024)
 
-            sid = base64.b64decode(request.headers["ashtp-Session"])
+            sid = base64.b64decode(request.headers[BaseHeaders.SESSION])
             active = self.activeSessions.get(sid)
             if active is None:
                 raise HandshakeError("unknown session")
 
-            count = int(request.headers["ashtp-Counter"])
+            count = int(request.headers[BaseHeaders.COUNTER])
+            url = str(request.url)
 
-            req = ASHTPBase.TearOpen(raw, "POST", self.serverAuthEndpoint, count, active.session, sid)# TODO same problem fix the Read Body function its fucky
+            if request.headers.get(BaseHeaders.CONTENT_TYPE) != ContentType.JSON:
+                raise ParsingError("auth has to be json")  # ReadBody would otherwise happily accept a file stream here
+            if int(request.headers.get("content-length", 0)) > 2 * 1024:
+                raise ContentTooLarge("auth body too large")
+
+            req = await ASHTPBase.ReadBody(request, active.session, sid)
             req = ASHTPBase.Parse(req, self.AUTH_FORMAT)
+
 
             apiKey = req["api_key"]
             allowed, permissionLevel, name = await self.keyAuthority.CheckPerms(apiKey)
@@ -256,8 +345,9 @@ class ASHTPServer:#TODO update header signatures
                 active.permsLevel = permissionLevel
                 active.name = name
 
-                data, n = ASHTPBase.Seal({"ok": "ok"}, "POST", self.serverAuthEndpoint, active.session, sid, count)
-                return Response(content=data)#, headers=headers) TODO wants basic headers make a function for it in base
+                data, n = ASHTPBase.Seal({"ok": "ok"}, "POST", url, active.session, sid, count)
+                headers = ASHTPBase.StandardHeaders(ContentType.JSON, sid, n, False, len(data))
+                return Response(content=data, headers=headers, media_type="application/octet-stream")
             else:
                 self.activeSessions.pop(sid)
                 self.authFails.Hit("*")
@@ -266,9 +356,9 @@ class ASHTPServer:#TODO update header signatures
 
 
         except ContentTooLarge:
-            return Response(status_code=413) # too large bish
-        except (KeyError, ValueError, ParsingError, HandshakeError, ReplayError, InvalidTag) as e:
+            return Response(status_code=413)
+        except (KeyError, ValueError, ParsingError, HandshakeError, ReplayError, InvalidTag, MalformedHeader, TamperedPackage) as e:
             self.Error(str(e))
-            return Response(status_code=400)# bad req
+            return Response(status_code=400)
         except KeyLacksPermissionError:
-            return Response(status_code=403)# no no perms
+            return Response(status_code=403)
